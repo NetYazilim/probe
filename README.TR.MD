@@ -11,7 +11,7 @@ Go ile yazılmış çok protokollü sağlık kontrolü kütüphanesi. Öncelikle
 - **ICMP Ping Probe** - ICMP Echo kullanarak ana bilgisayar erişilebilirliğini kontrol edin (IP adresleri ve hostname'leri destekler; Linux'ta IPv6 desteği vardır).
 - **TCP Probe** - Port bağlantısı ve bağlantı bilgilerini doğrulayın (IPv4 ve IPv6 hedeflerde çalışır).
 - **HTTP/HTTPS Probe** - Web servisi sağlığını durum kodu kontrolleriyle doğrulayın (IPv4/IPv6 uç noktaları otomatik desteklenir).
-- **TLS/SSL Probe** - SSL/TLS sertifika bilgilerini (Bitiş Tarihi, Kalan Gün Sayısı, Yayınlayan vb.) doğrudan sunucudan alın ve doğrulayın (IPv4 veya IPv6 üzerinden erişilebilir).
+- **TLS/SSL Probe** - IPv4 ve IPv6 üzerinde iki modu destekler: strict TLS doğrulaması (`tls`) ve yalnızca sertifika inceleme modu (`tls-cert`). Sertifika-only modunda, sunucu mTLS/istemci sertifikası istese ve tam TLS oturumu kurulmasa bile sunulan sunucu sertifikası okunabilir.
 - **Harici Go kütüphane bağımlılığı yoktur - yalnızca Go standart kütüphanesi kullanılır.**
 
 ## Platform Desteği
@@ -59,32 +59,37 @@ go get "github.com/netyazilim/probe"
 # ICMP Ping (IP Adresleri veya Hostname'ler)
 ./probe ping 8.8.8.8
 ./probe ping google.com
-./probe -attempts 5 ping 8.8.8.8
-./probe -timeout 2s ping google.com
-./probe -loop 5s ping 8.8.8.8                    # Her 5 saniyede çalıştır
+./probe ping -attempts 5 8.8.8.8
+./probe ping -timeout 2s google.com
+./probe ping -loop 5s 8.8.8.8                    # Her 5 saniyede çalıştır
 
 # TCP Probe (Port Bağlantısı)
 ./probe tcp example.com:22
 ./probe tcp google.com:443
-./probe -attempts 5 tcp google.com:443
-./probe -loop 10s tcp google.com:443             # Her 10 saniyede çalıştır
+./probe tcp -attempts 5 google.com:443
+./probe tcp -loop 10s google.com:443             # Her 10 saniyede çalıştır
 
 # HTTP/HTTPS (URL'ler)
 ./probe http https://google.com
-./probe -timeout 3s http https://example.com
-./probe -loop 1m http https://google.com         # Her 1 dakikada çalıştır
+./probe http -timeout 3s https://example.com
+./probe http -loop 1m https://google.com         # Her 1 dakikada çalıştır
 
-# TLS/SSL Sertifika Bilgisi
+# TLS/SSL Strict Kontrol
 ./probe tls google.com:443
-./probe -timeout 10s tls example.com:443
-./probe -loop 30m tls google.com:443             # Her 30 dakikada çalıştır
+./probe tls -timeout 10s example.com:443
+./probe tls -loop 30m google.com:443             # Her 30 dakikada çalıştır
+
+# TLS/SSL Yalnızca Sertifika Kontrolü
+./probe tls-cert google.com:443
+./probe tls-cert https://google.com
+./probe tls-cert -timeout 10s mtls.example.com:443
 ```
 
 ## Parametreler
 
 ```
 -attempts int     Maksimum deneme sayısı (varsayılan: 3)
--timeout duration Deneme başına zaman aşımı (varsayılan: ping/tcp/http için 1s, tls için 5s)
+-timeout duration Deneme başına zaman aşımı (varsayılan: ping/tcp/http için 1s, tls/tls-cert için 5s)
 -loop duration    Loop aralığı (0 = bir kez çalıştır, örn: 5s, 1m, 10s)
 ```
 
@@ -94,7 +99,8 @@ go get "github.com/netyazilim/probe"
 ping               ICMP ping probe'u (IP adresleri ve hostname'leri destekler)
 tcp                TCP port bağlantısı kontrolü (host:port formatı)
 http               HTTP/HTTPS durum kontrolü (URL formatı)
-tls                TLS/SSL sertifika bilgisi (host:port formatı)
+tls                Strict TLS/SSL handshake ve sertifika doğrulaması (host:port veya URL formatı)
+tls-cert           Tam handshake gerektirmeden TLS/SSL sertifika incelemesi (host:port veya URL formatı)
 ```
 
 ## Zaman Aşımı Konfigürasyonu
@@ -117,6 +123,7 @@ docker run --rm probe ping 8.8.8.8
 docker run --rm probe tcp google.com:443
 docker run --rm probe http https://google.com
 docker run --rm probe tls google.com:443
+docker run --rm probe tls-cert mtls.example.com:443
 
 # Özel deneme sayısı ve timeout ile çalıştır
 docker run --rm probe ping -attempts 5 8.8.8.8
@@ -159,7 +166,7 @@ Status Code: 200
 Duration: 125.45 ms
 ```
 
-### TLS/SSL
+### TLS/SSL (strict)
 ```
 Host: google.com
 Attempt: 3
@@ -171,6 +178,21 @@ Expires At: 2025-12-15 23:59:59
 Days Until Expiry: 310
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
+```
+
+### TLS/SSL (yalnızca sertifika)
+```
+Host: mtls.example.com
+Attempt: 1
+Success: true
+Duration: 210.12 ms
+Subject: CN=mtls.example.com
+Issuer: CN=Example Issuing CA
+Expires At: 2026-12-15 23:59:59
+Days Until Expiry: 213
+TLS Version: TLS 1.3
+Cipher Suite: TLS_AES_128_GCM_SHA256
+Handshake Warning: remote error: tls: certificate required
 ```
 
 ## Bağımlılıklar

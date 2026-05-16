@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -13,6 +15,7 @@ type Result struct {
 	Success         bool
 	Attempts        int
 	Error           error
+	HandshakeError  error
 	Duration        time.Duration
 	Subject         string
 	Issuer          string
@@ -22,19 +25,31 @@ type Result struct {
 	CipherSuite     string
 }
 
-// Run performs TLS/SSL probe to the specified host.
-// host specifies the target host (hostname:port, e.g., example.com:443).
-// maxAttempts specifies the maximum number of attempts.
-// timeout specifies the maximum duration to wait for a response.
-// Returns a Result struct containing the TLS/SSL information.
-func Run(host string, maxAttempts int, timeout time.Duration) Result {
-	hostname := host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		hostname = h
+// Run performs a strict TLS/SSL probe.
+// The handshake must complete successfully and certificate verification must pass.
+func Run(target string, maxAttempts int, timeout time.Duration) Result {
+	return run(target, maxAttempts, timeout, false)
+}
+
+// RunCertOnly performs a certificate-only TLS/SSL probe.
+// It returns the presented server certificate even if the handshake cannot be
+// fully completed because the server requires a client certificate for mTLS.
+func RunCertOnly(target string, maxAttempts int, timeout time.Duration) Result {
+	return run(target, maxAttempts, timeout, true)
+}
+
+func run(target string, maxAttempts int, timeout time.Duration, certOnly bool) Result {
+	address, serverName, err := normalizeTLSTarget(target)
+	if err != nil {
+		return Result{
+			Host:     target,
+			Attempts: 0,
+			Error:    err,
+		}
 	}
 
 	result := Result{
-		Host:     hostname,
+		Host:     serverName,
 		Attempts: maxAttempts,
 	}
 
@@ -45,36 +60,49 @@ func Run(host string, maxAttempts int, timeout time.Duration) Result {
 
 		// Establish TCP connection first
 		dialer := &net.Dialer{Timeout: timeout}
-		conn, err := dialer.Dial("tcp", host)
+		rawConn, err := dialer.Dial("tcp", address)
 		if err != nil {
 			result.Duration = time.Since(startTime)
 			result.Error = fmt.Errorf("TCP connection failed: %v", err)
-			time.Sleep(500 * time.Millisecond)
+			result.HandshakeError = nil
+			if i < maxAttempts-1 {
+				time.Sleep(500 * time.Millisecond)
+			}
 			continue
 		}
 
-		// Perform TLS handshake
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName:         hostname,
-			InsecureSkipVerify: false,
+		// In cert-only mode, still collect the presented certificate even if the
+		// server expects a client certificate (mTLS) and the handshake fails.
+		tlsConn := tls.Client(rawConn, &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: certOnly,
 		})
 
-		err = tlsConn.Handshake()
+		handshakeErr := tlsConn.Handshake()
+		state := tlsConn.ConnectionState()
 		result.Duration = time.Since(startTime)
+		_ = tlsConn.Close()
 
-		if err != nil {
-			_ = tlsConn.Close()
-			result.Error = fmt.Errorf("TLS handshake failed: %v", err)
-			time.Sleep(500 * time.Millisecond)
+		certs := state.PeerCertificates
+		if len(certs) == 0 {
+			if handshakeErr != nil {
+				result.Error = fmt.Errorf("TLS handshake failed: %v", handshakeErr)
+			} else {
+				result.Error = fmt.Errorf("TLS handshake did not return a certificate")
+			}
+			result.HandshakeError = nil
+			if i < maxAttempts-1 {
+				time.Sleep(500 * time.Millisecond)
+			}
 			continue
 		}
 
-		// Retrieve certificates
-		certs := tlsConn.ConnectionState().PeerCertificates
-		if len(certs) == 0 {
-			_ = tlsConn.Close()
-			result.Error = fmt.Errorf("no certificates found")
-			time.Sleep(500 * time.Millisecond)
+		if handshakeErr != nil && !certOnly {
+			result.Error = fmt.Errorf("TLS handshake failed: %v", handshakeErr)
+			result.HandshakeError = handshakeErr
+			if i < maxAttempts-1 {
+				time.Sleep(500 * time.Millisecond)
+			}
 			continue
 		}
 
@@ -83,15 +111,63 @@ func Run(host string, maxAttempts int, timeout time.Duration) Result {
 		result.Issuer = cert.Issuer.String()
 		result.ExpiresAt = cert.NotAfter
 		result.DaysUntilExpiry = int(time.Until(cert.NotAfter).Hours() / 24)
-		result.Protocol = tlsVersionToString(tlsConn.ConnectionState().Version)
-		result.CipherSuite = tls.CipherSuiteName(tlsConn.ConnectionState().CipherSuite)
+		result.Protocol = tlsVersionToString(state.Version)
+		result.CipherSuite = tls.CipherSuiteName(state.CipherSuite)
 		result.Success = true
 		result.Error = nil
-		_ = tlsConn.Close()
+		if certOnly {
+			result.HandshakeError = handshakeErr
+		} else {
+			result.HandshakeError = nil
+		}
 		break
 	}
 
 	return result
+}
+
+func normalizeTLSTarget(target string) (string, string, error) {
+	raw := strings.TrimSpace(target)
+	if raw == "" {
+		return "", "", fmt.Errorf("target is empty")
+	}
+
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid TLS target %q: %w", target, err)
+		}
+		raw = u.Host
+		if raw == "" {
+			return "", "", fmt.Errorf("invalid TLS target %q: missing host", target)
+		}
+	}
+
+	const defaultPort = "443"
+	host := raw
+	port := defaultPort
+
+	if parsedHost, parsedPort, err := net.SplitHostPort(raw); err == nil {
+		host = parsedHost
+		port = parsedPort
+	} else {
+		trimmed := strings.TrimSpace(strings.Trim(raw, "[]"))
+		if ip := net.ParseIP(trimmed); ip != nil {
+			host = trimmed
+		} else if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+			host = trimmed
+		} else if strings.Count(raw, ":") > 0 {
+			return "", "", fmt.Errorf("invalid TLS target %q: %w", target, err)
+		}
+	}
+
+	serverName := strings.TrimSpace(strings.Trim(host, "[]"))
+	if serverName == "" {
+		return "", "", fmt.Errorf("invalid TLS target %q: missing hostname", target)
+	}
+
+	address := net.JoinHostPort(serverName, port)
+	return address, serverName, nil
 }
 
 // tlsVersionToString converts TLS version to string format

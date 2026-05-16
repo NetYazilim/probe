@@ -1,6 +1,6 @@
 # Probe - Multi-Protocol Health Check
 
-[Turkish README](README.TR.md) 
+[Turkish README](README.TR.MD)
 
 
 
@@ -13,7 +13,7 @@ Multi-protocol health check library written in Go. Import as a package in your p
 - **ICMP Ping Probe** - Check host availability using ICMP Echo (supports both IP addresses and hostnames; IPv6 support available on Linux).
 - **TCP Probe** - Verify port connectivity and connection information (works with both IPv4 and IPv6 targets).
 - **HTTP/HTTPS Probe** - Verify web service health with status code checks (supports IPv4/IPv6 endpoints transparently).
-- **TLS/SSL Probe** - Retrieve and validate SSL/TLS certificate information (Expiry Date, Days Remaining, Issuer, etc.) directly from the server over IPv4 or IPv6.
+- **TLS/SSL Probe** - Supports two modes over IPv4 or IPv6: strict TLS validation (`tls`) and certificate-only inspection (`tls-cert`). The certificate-only mode can still read the presented server certificate even when full TLS negotiation is blocked by mTLS/client-certificate requirements.
 - **No external Go package dependencies - uses only Go standard library.**
 
 ## Platform Support
@@ -61,32 +61,37 @@ go get "github.com/netyazilim/probe"
 # ICMP Ping (IP Addresses or Hostnames)
 ./probe ping 8.8.8.8
 ./probe ping google.com
-./probe -attempts 5 ping 8.8.8.8
-./probe -timeout 2s ping google.com
-./probe -loop 5s ping 8.8.8.8                    # Run every 5 seconds
+./probe ping -attempts 5 8.8.8.8
+./probe ping -timeout 2s google.com
+./probe ping -loop 5s 8.8.8.8                    # Run every 5 seconds
 
 # TCP Probe (Port Connectivity)
 ./probe tcp example.com:22
 ./probe tcp google.com:443
-./probe -attempts 5 tcp google.com:443
-./probe -loop 10s tcp google.com:443             # Run every 10 seconds
+./probe tcp -attempts 5 google.com:443
+./probe tcp -loop 10s google.com:443             # Run every 10 seconds
 
 # HTTP/HTTPS (URLs)
 ./probe http https://google.com
-./probe -timeout 3s http https://example.com
-./probe -loop 1m http https://google.com         # Run every 1 minute
+./probe http -timeout 3s https://example.com
+./probe http -loop 1m https://google.com         # Run every 1 minute
 
-# TLS/SSL Certificate Info
+# TLS/SSL Strict Check
 ./probe tls google.com:443
-./probe -timeout 10s tls example.com:443
-./probe -loop 30m tls google.com:443             # Run every 30 minutes
+./probe tls -timeout 10s example.com:443
+./probe tls -loop 30m google.com:443             # Run every 30 minutes
+
+# TLS/SSL Certificate-Only Check
+./probe tls-cert google.com:443
+./probe tls-cert https://google.com
+./probe tls-cert -timeout 10s mtls.example.com:443
 ```
 
 ## Flags
 
 ```
 -attempts int     Maximum number of attempts (default: 3)
--timeout duration Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls)
+-timeout duration Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls/tls-cert)
 -loop duration    Loop interval (0 = run once, e.g., 5s, 1m, 10s)
 ```
 
@@ -96,7 +101,8 @@ go get "github.com/netyazilim/probe"
 ping               ICMP ping probe (supports IP addresses and hostnames)
 tcp                TCP port connectivity check (host:port format)
 http               HTTP/HTTPS status check (URL format)
-tls                TLS/SSL certificate information (host:port format)
+tls                Strict TLS/SSL handshake and certificate validation (host:port or URL format)
+tls-cert           TLS/SSL certificate inspection without requiring a full handshake (host:port or URL format)
 ```
 
 ## Timeout Configuration
@@ -119,6 +125,7 @@ docker run --rm probe ping 8.8.8.8
 docker run --rm probe tcp google.com:443
 docker run --rm probe http https://google.com
 docker run --rm probe tls google.com:443
+docker run --rm probe tls-cert mtls.example.com:443
 ```
 
 ### Docker Note
@@ -154,7 +161,7 @@ Status Code: 200
 Duration: 125.45 ms
 ```
 
-### TLS/SSL
+### TLS/SSL (strict)
 ```
 Host: google.com
 Attempt: 3
@@ -166,6 +173,21 @@ Expires At: 2025-12-15 23:59:59
 Days Until Expiry: 310
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
+```
+
+### TLS/SSL (certificate-only)
+```
+Host: mtls.example.com
+Attempt: 1
+Success: true
+Duration: 210.12 ms
+Subject: CN=mtls.example.com
+Issuer: CN=Example Issuing CA
+Expires At: 2026-12-15 23:59:59
+Days Until Expiry: 213
+TLS Version: TLS 1.3
+Cipher Suite: TLS_AES_128_GCM_SHA256
+Handshake Warning: remote error: tls: certificate required
 ```
 
 

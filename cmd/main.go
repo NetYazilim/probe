@@ -57,7 +57,7 @@ func main() {
 
 	// Set default timeout based on command
 	defaultTimeout := 1 * time.Second
-	if command == "tls" {
+	if command == "tls" || command == "tls-cert" {
 		defaultTimeout = 5 * time.Second
 	}
 
@@ -91,7 +91,9 @@ func executeProbe(command, target string, timeout time.Duration) {
 	case "tcp":
 		handleTCP(target, timeout)
 	case "tls":
-		handleTLS(target, timeout)
+		handleTLS(target, timeout, false)
+	case "tls-cert":
+		handleTLS(target, timeout, true)
 	case "http":
 		handleHTTP(target, timeout)
 	default:
@@ -103,17 +105,18 @@ func executeProbe(command, target string, timeout time.Duration) {
 
 func printUsage() {
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Println("║            Probe - Multi-Protocol Status Check              ║")
+	fmt.Println("║            Probe - Multi-Protocol Health Check              ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println("\nUsage: probe <command> [flags] <target>")
 	fmt.Println("\nCommands:")
 	fmt.Println("  ping              ICMP ping probe (IP or hostname)")
 	fmt.Println("  tcp               TCP port connectivity check")
-	fmt.Println("  tls               TLS/SSL certificate information")
+	fmt.Println("  tls               Strict TLS/SSL handshake and certificate check")
+	fmt.Println("  tls-cert          TLS/SSL certificate info without requiring full handshake")
 	fmt.Println("  http              HTTP/HTTPS status check")
 	fmt.Println("\nFlags:")
 	fmt.Println("  -attempts int     Maximum number of attempts (default: 3)")
-	fmt.Println("  -timeout duration Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls)")
+	fmt.Println("  -timeout duration Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls/tls-cert)")
 	fmt.Println("  -loop duration    Loop interval (0 = run once, e.g., 5s, 1m, 10s)")
 	fmt.Println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("Examples:")
@@ -136,10 +139,15 @@ func printUsage() {
 	fmt.Println("  probe http -timeout 3s https://example.com")
 	fmt.Println("  probe http -loop 1m https://google.com          # Run every 1 minute")
 
-	fmt.Println("\n4. TLS/SSL Certificate Information")
+	fmt.Println("\n4. TLS/SSL Strict Check")
 	fmt.Println("  probe tls google.com:443")
 	fmt.Println("  probe tls -timeout 10s example.com:443")
 	fmt.Println("  probe tls -loop 30m google.com:443              # Run every 30 minutes")
+
+	fmt.Println("\n5. TLS/SSL Certificate-Only Check")
+	fmt.Println("  probe tls-cert google.com:443")
+	fmt.Println("  probe tls-cert https://example.com")
+	fmt.Println("  probe tls-cert -timeout 10s mtls.example.com:443")
 
 	fmt.Println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("Default Timeouts:")
@@ -192,8 +200,13 @@ func handleTCP(target string, timeout time.Duration) {
 	}
 }
 
-func handleTLS(target string, timeout time.Duration) {
-	result := tls.Run(target, maxAttempts, timeout)
+func handleTLS(target string, timeout time.Duration, certOnly bool) {
+	var result tls.Result
+	if certOnly {
+		result = tls.RunCertOnly(target, maxAttempts, timeout)
+	} else {
+		result = tls.Run(target, maxAttempts, timeout)
+	}
 
 	fmt.Printf("Host: %s\n", result.Host)
 	fmt.Printf("Attempt: %d\n", result.Attempts)
@@ -210,6 +223,9 @@ func handleTLS(target string, timeout time.Duration) {
 		fmt.Printf("Days Until Expiry: %d\n", result.DaysUntilExpiry)
 		fmt.Printf("TLS Version: %s\n", result.Protocol)
 		fmt.Printf("Cipher Suite: %s\n", result.CipherSuite)
+		if certOnly && result.HandshakeError != nil {
+			fmt.Printf("Handshake Warning: %v\n", result.HandshakeError)
+		}
 	}
 
 	if result.Error != nil {
