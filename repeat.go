@@ -73,7 +73,10 @@ func Repeat(ctx context.Context, o Options, attempt func(context.Context) (time.
 			s.Successes++
 			s.Last = d
 			s.Total += d
-			if s.Min == 0 || d < s.Min {
+			// Keyed on the first success rather than on a zero Min, because a
+			// zero duration is a real measurement on platforms whose clock is
+			// coarser than a fast local operation, not an "unset" marker.
+			if s.Successes == 1 || d < s.Min {
 				s.Min = d
 			}
 			if d > s.Max {

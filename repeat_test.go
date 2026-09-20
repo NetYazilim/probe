@@ -249,3 +249,33 @@ func TestSummarizeSingleSuccessHasEqualSpread(t *testing.T) {
 			sum.Min, sum.Avg, sum.Max, sum.Duration)
 	}
 }
+
+func TestRepeatAcceptsZeroDurations(t *testing.T) {
+	// A fast local operation can measure as exactly zero where the platform
+	// clock is coarser than the operation itself; Windows does this on
+	// loopback. Zero is a measurement, not a missing value.
+	calls := 0
+	fn := func(context.Context) (time.Duration, error) {
+		calls++
+		if calls == 3 {
+			return 5 * time.Millisecond, nil
+		}
+		return 0, nil
+	}
+
+	s := Repeat(context.Background(), opts(3, 3), fn)
+	sum := s.Summarize(3)
+
+	if !sum.Success {
+		t.Fatalf("Success = false although every attempt succeeded: %+v", sum)
+	}
+	if sum.Min != 0 {
+		t.Errorf("Min = %v, want 0: two attempts genuinely measured zero", sum.Min)
+	}
+	if sum.Max != 5*time.Millisecond {
+		t.Errorf("Max = %v, want 5ms", sum.Max)
+	}
+	if sum.Min > sum.Avg || sum.Avg > sum.Max {
+		t.Errorf("ordering broken: min %v avg %v max %v", sum.Min, sum.Avg, sum.Max)
+	}
+}

@@ -51,8 +51,10 @@ func TestRunContextSucceedsAgainstOpenPort(t *testing.T) {
 	if r.LocalAddr == "" || r.RemoteAddr == "" {
 		t.Errorf("connection addresses not recorded: local %q remote %q", r.LocalAddr, r.RemoteAddr)
 	}
-	if r.Duration <= 0 {
-		t.Error("Duration = 0, want a measured duration")
+	// Not asserted to be positive: on a fast loopback connection the clock may
+	// not resolve the dial at all, and a zero duration is a legitimate result.
+	if r.Duration < 0 {
+		t.Errorf("Duration = %v, want a non-negative duration", r.Duration)
 	}
 	host, port, _ := net.SplitHostPort(addr)
 	if r.Host != host || r.Port != port {
@@ -152,7 +154,9 @@ func TestSuccessThresholdRequiresSeveralConnections(t *testing.T) {
 	if r.Successes != 3 || r.Attempts != 3 {
 		t.Errorf("attempts/successes = %d/%d, want exactly the 3 required", r.Attempts, r.Successes)
 	}
-	if r.Min <= 0 || r.Max < r.Min || r.Avg < r.Min || r.Avg > r.Max {
+	// Only the ordering is guaranteed. A loopback dial can measure as zero
+	// where the platform clock is coarser than the operation.
+	if r.Min < 0 || r.Max < r.Min || r.Avg < r.Min || r.Avg > r.Max {
 		t.Errorf("inconsistent spread: min %v avg %v max %v", r.Min, r.Avg, r.Max)
 	}
 }
