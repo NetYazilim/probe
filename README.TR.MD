@@ -12,6 +12,9 @@ Go ile yazılmış çok protokollü sağlık kontrolü kütüphanesi. Öncelikle
 - **TCP Probe** - Port bağlantısı ve bağlantı bilgilerini doğrulayın (IPv4 ve IPv6 hedeflerde çalışır).
 - **HTTP/HTTPS Probe** - Web servisi sağlığını durum kodu kontrolleriyle doğrulayın (IPv4/IPv6 uç noktaları otomatik desteklenir).
 - **TLS/SSL Probe** - IPv4 ve IPv6 üzerinde iki modu destekler: strict TLS doğrulaması (`tls`) ve yalnızca sertifika inceleme modu (`tls-cert`). Sertifika-only modunda, sunucu mTLS/istemci sertifikası istese ve tam TLS oturumu kurulmasa bile sunulan sunucu sertifikası okunabilir.
+- **Başarı eşiği** - denemelerin kaçının cevap vermesi gerektiğine siz karar verirsiniz. Probe, eşiğe ulaşır ulaşmaz durur; kalan denemeler eşiğe artık yetişemiyorsa yine durur.
+- **İptal edilebilir** - her probe bir `context.Context` alır ve onu yalnızca denemeler arasında değil, bağlanırken, handshake yaparken ve cevap beklerken de dinler.
+- **Ayarlanabilir ICMP payload boyutu** - `-size` ping'i path MTU kontrolü için kullanılabilir kılar; ayrıca farklı hedeflere aynı boyutta paket gönderildiği için gidiş-dönüş süreleri karşılaştırılabilir olur.
 - **Asgari bağımlılık** - `golang.org/x/net` yalnızca Linux'ta ICMP ping için gereklidir; TCP, HTTP ve TLS probe'ları ile Windows ve macOS derlemeleri tek başına Go standart kütüphanesini kullanır.
 
 ## Platform Desteği
@@ -59,6 +62,79 @@ sudo sysctl -p /etc/sysctl.d/99-ping.conf
 go get "github.com/netyazilim/probe"
 ```
 
+## Kütüphane olarak kullanım
+
+Her probe kendi paketinde ve aynı iki giriş noktasını sunuyor: yeni kod için
+`RunContext`, eski API'ye göre yazılmış çağrılar için `Run`.
+
+```go
+import (
+    "context"
+    "time"
+
+    "github.com/netyazilim/probe"
+    "github.com/netyazilim/probe/pkg/probeping"
+    "github.com/netyazilim/probe/pkg/probetcp"
+    "github.com/netyazilim/probe/pkg/probehttp"
+    "github.com/netyazilim/probe/pkg/probetls"
+)
+
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+r := probeping.RunContext(ctx, "8.8.8.8", probe.Options{
+    MaxAttempts:      5,
+    SuccessThreshold: 3,               // 5 denemenin 3'ü cevap vermeli
+    Timeout:          time.Second,     // deneme başına
+    Interval:         200 * time.Millisecond,
+    Size:             1472,            // ICMP payload baytı
+    Logger:           logger,          // *slog.Logger, nil olabilir
+})
+
+if r.Success {
+    fmt.Println(r.Duration, r.Min, r.Avg, r.Max)
+}
+```
+
+### Options
+
+Sıfır değeri kullanılabilir: sıfır bırakılan her alan varsayılanını alır.
+
+| Alan | Varsayılan | Anlamı |
+|---|---|---|
+| `MaxAttempts` | 3 | Deneme üst sınırı; hedef değil |
+| `SuccessThreshold` | 1 | Geçmek için gereken başarılı deneme; `MaxAttempts`'i aşamaz |
+| `Timeout` | 1s (TLS'te 5s) | Tek bir denemeyi sınırlar, tüm çalışmayı değil |
+| `Interval` | 500ms | Denemeler arası bekleme |
+| `Size` | 56 | ICMP payload baytı; diğer probe'lar yok sayar |
+| `Logger` | yok sayar | Deneme ayrıntısını alan `*slog.Logger` |
+
+### Result
+
+Her `Result`, `probe.Summary`'yi gömer; böylece bu alanlar hangi probe
+üretirse üretsin aynı anlama gelir ve aynı şekilde okunur:
+
+| Alan | Anlamı |
+|---|---|
+| `Success` | `SuccessThreshold`'a ulaşıldı mı |
+| `Attempts`, `Successes`, `Failures` | Kaç deneme yapıldı ve nasıl sonuçlandı |
+| `Duration` | En son başarılı deneme |
+| `Min`, `Avg`, `Max` | Başarılı denemeler üzerinden; tek başarı varsa üçü de `Duration`'a eşittir |
+| `Error` | Görülen son hata; `Success` true ise `nil` |
+
+Her paket bunun üstüne kendi alanlarını ekler: ping için
+`Address`/`ResolvedIP`/`BytesRecv`, tcp için
+`Host`/`Port`/`LocalAddr`/`RemoteAddr`, http için `URL`/`StatusCode`, tls için
+sertifika ayrıntıları.
+
+### Geriye uyumluluk
+
+`Run(target, maxAttempts, timeout)` her pakette duruyor ve eskisi gibi
+davranıyor; mevcut çağrı satırlarınız değişmeden derlenir. Yalnızca import
+yolları değişti: `pkg/http` ve `pkg/tls` standart kütüphaneyi gölgeleyip her
+çağıran tarafta alias'a zorluyordu, bu yüzden paketler artık `pkg/probeping`,
+`pkg/probetcp`, `pkg/probehttp` ve `pkg/probetls`.
+
 ## Kullanım
 
 ```bash
@@ -69,8 +145,11 @@ go get "github.com/netyazilim/probe"
 ./probe ping 8.8.8.8
 ./probe ping google.com
 ./probe ping -attempts 5 8.8.8.8
+./probe ping -attempts 5 -threshold 3 8.8.8.8     # 5 denemenin 3'ü yeterli
+./probe ping -size 1472 gateway.local             # path MTU kontrolü
 ./probe ping -timeout 2s google.com
-./probe ping -loop 5s 8.8.8.8                    # Her 5 saniyede çalıştır
+./probe ping -debug 8.8.8.8                       # deneme ayrıntısı stderr'e
+./probe ping -loop 5s 8.8.8.8                     # Her 5 saniyede çalıştır
 
 # TCP Probe (Port Bağlantısı)
 ./probe tcp example.com:22
@@ -97,9 +176,23 @@ go get "github.com/netyazilim/probe"
 ## Parametreler
 
 ```
--attempts int     Maksimum deneme sayısı (varsayılan: 3)
--timeout duration Deneme başına zaman aşımı (varsayılan: ping/tcp/http için 1s, tls/tls-cert için 5s)
--loop duration    Loop aralığı (0 = bir kez çalıştır, örn: 5s, 1m, 10s)
+-attempts int      Maksimum deneme sayısı (varsayılan: 3)
+-threshold int     Geçmek için gereken başarılı deneme (varsayılan: 1)
+-timeout duration  Deneme başına zaman aşımı (varsayılan: ping/tcp/http için 1s, tls/tls-cert için 5s)
+-interval duration Denemeler arası bekleme (varsayılan: 500ms)
+-loop duration     Loop aralığı (0 = bir kez çalıştır, örn: 5s, 1m, 10s)
+-size int          ICMP payload boyutu, yalnızca ping (varsayılan: 56)
+-debug             Deneme ayrıntısını stderr'e yaz
+```
+
+**Parametreler hedeften önce yazılmalı.** Go'nun flag ayrıştırıcısı ilk
+parametre olmayan argümanda durur; hedeften sonra yazılan her şey aksi hâlde
+sessizce yok sayılırdı. `probe` bunun yerine reddediyor:
+
+```
+$ probe tcp example.com:22 -attempts 5
+Error: unexpected argument(s) after the target: -attempts 5
+Flags must come before the target, e.g. probe tcp -attempts 5 example.com:22
 ```
 
 ## Komutlar
@@ -150,9 +243,22 @@ Container, yetkisiz bir kullanıcı (`probeuser`) olarak çalışır.
 ### ICMP Ping
 ```
 Target: 8.8.8.8
-Attempt: 3
+Attempt: 1
 Success: true
 Duration: 45.32 ms
+```
+
+`Attempt`, gerçekte kaç deneme yapıldığını gösterir. Eşik birden büyükse ya da
+başarısız bir deneme olduysa sayaçlar ve dağılım da raporlanır:
+
+```
+$ probe ping -attempts 5 -threshold 3 8.8.8.8
+Target: 8.8.8.8
+Attempt: 4
+Success: true
+Successes: 3  Failures: 1
+Duration: 45.32 ms
+Min/Avg/Max: 44.90 ms / 45.60 ms / 46.51 ms
 ```
 
 ### TCP Probe
@@ -230,9 +336,12 @@ olarak görünür.
 
 ## Hata İşleme
 
-Tüm probe'lar `-attempts` kadar (varsayılan 3) yeniden dener, denemeler arasında
-500 ms bekler ve ilk başarıda durur. Sorun giderme için ayrıntılı hata mesajları
-üretilir.
+Tüm probe'lar `-attempts` kadar (varsayılan 3) yeniden dener ve denemeler
+arasında `-interval` kadar bekler (varsayılan 500 ms). Probe, `-threshold`
+kadar deneme başarılı olur olmaz durur — varsayılan eşik 1 olduğu için bu ilk
+başarı demektir — ve kalan denemeler eşiğe artık yetişemiyorsa yine durur,
+çünkü devam etmenin öğreteceği bir şey kalmamıştır. Sorun giderme için
+ayrıntılı hata mesajları üretilir.
 
 ### Çıkış kodları
 
@@ -241,9 +350,15 @@ Tüm probe'lar `-attempts` kadar (varsayılan 3) yeniden dener, denemeler arası
 | Tek seferlik | Probe başarılıysa `0`, başarısızsa `1` |
 | Döngü (`-loop`) | Başarısız tur raporlanır ve döngü devam eder; süreç yalnızca `Ctrl+C` ile biter |
 
+`Ctrl+C` yalnızca süreci öldürmekle kalmaz, uçuştaki probe'u da iptal eder;
+döngü modunda bir sonraki tick'i beklemeden çıkar. İkinci `Ctrl+C` süreci
+anında sonlandırır.
+
 Geçersiz argümanlar ilk probe çalışmadan önce, `1` çıkış koduyla reddedilir:
-`-attempts` en az 1 olmalı, `-timeout` ve `-loop` negatif olmamalı, bilinmeyen
-komut her turda değil bir kez raporlanır.
+`-attempts` ve `-threshold` en az 1 olmalı, `-threshold` `-attempts`'i aşmamalı,
+`-timeout`, `-interval`, `-loop` ve `-size` negatif olmamalı, bilinmeyen komut
+her turda değil bir kez raporlanır, hedeften sonra gelen her argüman
+reddedilir.
 
 ### Gidiş-dönüş süresi nasıl ölçülür
 

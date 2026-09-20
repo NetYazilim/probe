@@ -14,6 +14,9 @@ Multi-protocol health check library written in Go. Import as a package in your p
 - **TCP Probe** - Verify port connectivity and connection information (works with both IPv4 and IPv6 targets).
 - **HTTP/HTTPS Probe** - Verify web service health with status code checks (supports IPv4/IPv6 endpoints transparently).
 - **TLS/SSL Probe** - Supports two modes over IPv4 or IPv6: strict TLS validation (`tls`) and certificate-only inspection (`tls-cert`). The certificate-only mode can still read the presented server certificate even when full TLS negotiation is blocked by mTLS/client-certificate requirements.
+- **Success threshold** - decide how many of the attempts have to answer. A probe stops as soon as the threshold is met, and equally as soon as the remaining attempts can no longer reach it.
+- **Cancellable** - every probe takes a `context.Context` and honours it while dialling, handshaking and waiting for a reply, not just between attempts.
+- **Configurable ICMP payload size** - `-size` makes ping usable for path MTU checks, and keeps packets to different targets the same size so their round-trip times are comparable.
 - **Minimal dependencies** - `golang.org/x/net` is required for ICMP ping on Linux only; the TCP, HTTP and TLS probes, and the Windows and macOS builds, use the Go standard library alone.
 
 ## Platform Support
@@ -60,6 +63,79 @@ sudo sysctl -p /etc/sysctl.d/99-ping.conf
 go get "github.com/netyazilim/probe"
 ```
 
+## Library usage
+
+Each probe lives in its own package and exposes the same pair of entry points:
+`RunContext` for new code, and `Run` for callers written against the original
+API.
+
+```go
+import (
+    "context"
+    "time"
+
+    "github.com/netyazilim/probe"
+    "github.com/netyazilim/probe/pkg/probeping"
+    "github.com/netyazilim/probe/pkg/probetcp"
+    "github.com/netyazilim/probe/pkg/probehttp"
+    "github.com/netyazilim/probe/pkg/probetls"
+)
+
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+r := probeping.RunContext(ctx, "8.8.8.8", probe.Options{
+    MaxAttempts:      5,
+    SuccessThreshold: 3,               // 3 of up to 5 must answer
+    Timeout:          time.Second,     // per attempt
+    Interval:         200 * time.Millisecond,
+    Size:             1472,            // ICMP payload bytes
+    Logger:           logger,          // *slog.Logger, may be nil
+})
+
+if r.Success {
+    fmt.Println(r.Duration, r.Min, r.Avg, r.Max)
+}
+```
+
+### Options
+
+The zero value is usable: every field left at zero takes its default.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `MaxAttempts` | 3 | Upper bound on attempts, not a target |
+| `SuccessThreshold` | 1 | Successful attempts needed to pass; must not exceed `MaxAttempts` |
+| `Timeout` | 1s (5s for TLS) | Bounds a single attempt, not the run |
+| `Interval` | 500ms | Pause between attempts |
+| `Size` | 56 | ICMP payload bytes; ignored by the other probes |
+| `Logger` | discard | `*slog.Logger` receiving per-attempt detail |
+
+### Result
+
+Every `Result` embeds `probe.Summary`, so these fields mean the same thing and
+are reached the same way whichever probe produced them:
+
+| Field | Meaning |
+|---|---|
+| `Success` | Whether `SuccessThreshold` was reached |
+| `Attempts`, `Successes`, `Failures` | How many attempts were made and how they went |
+| `Duration` | The most recent successful attempt |
+| `Min`, `Avg`, `Max` | Across successful attempts; all equal `Duration` when only one succeeded |
+| `Error` | The last error seen; `nil` when `Success` is true |
+
+Each package adds its own fields on top: `Address`/`ResolvedIP`/`BytesRecv` for
+ping, `Host`/`Port`/`LocalAddr`/`RemoteAddr` for tcp, `URL`/`StatusCode` for
+http, and the certificate details for tls.
+
+### Backwards compatibility
+
+`Run(target, maxAttempts, timeout)` still exists in every package and behaves
+as before, so existing call sites compile unchanged. Only the import paths
+moved: `pkg/http` and `pkg/tls` shadowed the standard library and forced an
+alias on every caller, so the packages are now `pkg/probeping`, `pkg/probetcp`,
+`pkg/probehttp` and `pkg/probetls`.
+
 ## Usage
 
 ```bash
@@ -70,8 +146,11 @@ go get "github.com/netyazilim/probe"
 ./probe ping 8.8.8.8
 ./probe ping google.com
 ./probe ping -attempts 5 8.8.8.8
+./probe ping -attempts 5 -threshold 3 8.8.8.8     # 3 of up to 5 must answer
+./probe ping -size 1472 gateway.local             # path MTU check
 ./probe ping -timeout 2s google.com
-./probe ping -loop 5s 8.8.8.8                    # Run every 5 seconds
+./probe ping -debug 8.8.8.8                       # per-attempt detail on stderr
+./probe ping -loop 5s 8.8.8.8                     # Run every 5 seconds
 
 # TCP Probe (Port Connectivity)
 ./probe tcp example.com:22
@@ -98,9 +177,23 @@ go get "github.com/netyazilim/probe"
 ## Flags
 
 ```
--attempts int     Maximum number of attempts (default: 3)
--timeout duration Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls/tls-cert)
--loop duration    Loop interval (0 = run once, e.g., 5s, 1m, 10s)
+-attempts int      Maximum number of attempts (default: 3)
+-threshold int     Successful attempts required to pass (default: 1)
+-timeout duration  Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls/tls-cert)
+-interval duration Pause between attempts (default: 500ms)
+-loop duration     Loop interval (0 = run once, e.g., 5s, 1m, 10s)
+-size int          ICMP payload size in bytes, ping only (default: 56)
+-debug             Log per-attempt detail to stderr
+```
+
+**Flags must come before the target.** Go's flag parser stops at the first
+non-flag argument, so anything written after the target would otherwise be
+ignored silently; `probe` rejects it instead:
+
+```
+$ probe tcp example.com:22 -attempts 5
+Error: unexpected argument(s) after the target: -attempts 5
+Flags must come before the target, e.g. probe tcp -attempts 5 example.com:22
 ```
 
 ## Commands
@@ -144,9 +237,22 @@ The container runs as an unprivileged user (`probeuser`).
 ### ICMP Ping
 ```
 Target: 8.8.8.8
-Attempt: 3
+Attempt: 1
 Success: true
 Duration: 45.32 ms
+```
+
+`Attempt` is how many attempts were actually made. With a threshold above one,
+or after a failed attempt, the counts and the spread are reported too:
+
+```
+$ probe ping -attempts 5 -threshold 3 8.8.8.8
+Target: 8.8.8.8
+Attempt: 4
+Success: true
+Successes: 3  Failures: 1
+Duration: 45.32 ms
+Min/Avg/Max: 44.90 ms / 45.60 ms / 46.51 ms
 ```
 
 ### TCP Probe
@@ -224,9 +330,12 @@ not implemented, so `golang.org/x/net` is pulled in by the Linux build only.
 
 ## Error Handling
 
-All probes retry up to `-attempts` times (3 by default) with a 500 ms pause
-between attempts, and stop at the first success. Detailed error messages are
-provided for troubleshooting.
+All probes retry up to `-attempts` times (3 by default) with a `-interval`
+pause between attempts (500 ms by default). A probe stops as soon as
+`-threshold` attempts have succeeded — with the default threshold of 1, that is
+the first success — and equally as soon as the attempts still remaining cannot
+reach the threshold, since there is nothing further to learn by continuing.
+Detailed error messages are provided for troubleshooting.
 
 ### Exit codes
 
@@ -235,9 +344,15 @@ provided for troubleshooting.
 | Single run | `0` when the probe succeeds, `1` when it fails |
 | Loop (`-loop`) | A failing round is reported and the loop keeps going; the process ends only on `Ctrl+C` |
 
+`Ctrl+C` cancels the probe in flight rather than only killing the process, and
+in loop mode it returns immediately instead of waiting for the next tick. A
+second `Ctrl+C` terminates at once.
+
 Invalid arguments are rejected before the first probe runs, with exit code `1`:
-`-attempts` must be at least 1, `-timeout` and `-loop` must not be negative, and
-an unknown command is reported once instead of on every iteration.
+`-attempts` and `-threshold` must be at least 1, `-threshold` must not exceed
+`-attempts`, `-timeout`, `-interval`, `-loop` and `-size` must not be negative,
+an unknown command is reported once instead of on every iteration, and any
+argument after the target is refused.
 
 ### How the round-trip time is measured
 
