@@ -82,8 +82,11 @@ func Repeat(ctx context.Context, o Options, attempt func(context.Context) (time.
 			if d > s.Max {
 				s.Max = d
 			}
+			// Formatted rather than passed as a Duration: slog renders a
+			// Duration as bare nanoseconds in JSON, which is unitless and
+			// easily mistaken for milliseconds.
 			o.Logger.Debug("probe attempt succeeded",
-				"attempt", s.Attempts, "of", o.MaxAttempts, "duration", d)
+				"attempt", s.Attempts, "of", o.MaxAttempts, "duration", d.String())
 
 			if s.Successes >= o.SuccessThreshold {
 				return s
