@@ -1,21 +1,30 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/signal"
+	"strings"
 	"time"
 
-	"github.com/netyazilim/probe/pkg/http"
-	"github.com/netyazilim/probe/pkg/ping"
-	"github.com/netyazilim/probe/pkg/tcp"
-	"github.com/netyazilim/probe/pkg/tls"
+	"github.com/netyazilim/probe"
+	"github.com/netyazilim/probe/pkg/probehttp"
+	"github.com/netyazilim/probe/pkg/probeping"
+	"github.com/netyazilim/probe/pkg/probetcp"
+	"github.com/netyazilim/probe/pkg/probetls"
 )
 
 var (
 	maxAttempts  int
+	threshold    int
 	timeout      time.Duration
+	interval     time.Duration
 	loopInterval time.Duration
+	size         int
+	debug        bool
 )
 
 func main() {
@@ -34,11 +43,14 @@ func main() {
 
 	// Parse remaining arguments
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
-	fs.IntVar(&maxAttempts, "attempts", 3, "Maximum number of attempts")
+	fs.IntVar(&maxAttempts, "attempts", probe.DefaultMaxAttempts, "Maximum number of attempts")
+	fs.IntVar(&threshold, "threshold", probe.DefaultSuccessThreshold, "Successful attempts required for the probe to succeed")
 	fs.DurationVar(&timeout, "timeout", 0, "Timeout per attempt (0 = use default)")
+	fs.DurationVar(&interval, "interval", probe.DefaultInterval, "Pause between attempts")
 	fs.DurationVar(&loopInterval, "loop", 0, "Loop interval (0 = run once, e.g., 5s, 1m)")
+	fs.IntVar(&size, "size", probe.DefaultSize, "ICMP payload size in bytes (ping only)")
+	fs.BoolVar(&debug, "debug", false, "Log per-attempt detail to stderr")
 
-	// Parse flags from position 2 onwards
 	err := fs.Parse(os.Args[2:])
 	if err != nil {
 		printUsage()
@@ -63,34 +75,65 @@ func main() {
 
 	target := args[0]
 
-	// Validate flags
-	if maxAttempts < 1 {
+	// flag.Parse stops at the first non-flag argument, so anything after the
+	// target was silently discarded before. Reject it instead: a user who
+	// writes "probe tcp host:port -attempts 5" means those flags to count.
+	if len(args) > 1 {
+		extra := args[1:]
+		fmt.Printf("Error: unexpected argument(s) after the target: %s\n", strings.Join(extra, " "))
+		if strings.HasPrefix(extra[0], "-") {
+			fmt.Println("Flags must come before the target, e.g. probe " + command + " -attempts 5 " + target)
+		}
+		os.Exit(1)
+	}
+
+	// Validate the flags as typed. The flag defaults are the real defaults, so a
+	// zero here was written by the user: Options treats zero as "unset", but on
+	// the command line "-attempts 0" is a mistake, not a request for 3.
+	switch {
+	case maxAttempts < 1:
 		fmt.Printf("Error: -attempts must be at least 1 (got %d)\n", maxAttempts)
 		os.Exit(1)
-	}
-	if timeout < 0 {
+	case threshold < 1:
+		fmt.Printf("Error: -threshold must be at least 1 (got %d)\n", threshold)
+		os.Exit(1)
+	case threshold > maxAttempts:
+		fmt.Printf("Error: -threshold (%d) cannot exceed -attempts (%d)\n", threshold, maxAttempts)
+		os.Exit(1)
+	case timeout < 0:
 		fmt.Printf("Error: -timeout must not be negative (got %v)\n", timeout)
 		os.Exit(1)
-	}
-	if loopInterval < 0 {
+	case interval < 0:
+		fmt.Printf("Error: -interval must not be negative (got %v)\n", interval)
+		os.Exit(1)
+	case size < 0:
+		fmt.Printf("Error: -size must not be negative (got %d)\n", size)
+		os.Exit(1)
+	case loopInterval < 0:
 		fmt.Printf("Error: -loop must not be negative (got %v)\n", loopInterval)
 		os.Exit(1)
 	}
 
-	// Set default timeout based on command
-	defaultTimeout := 1 * time.Second
-	if command == "tls" || command == "tls-cert" {
-		defaultTimeout = 5 * time.Second
+	opts := probe.Options{
+		MaxAttempts:      maxAttempts,
+		SuccessThreshold: threshold,
+		Timeout:          timeout,
+		Interval:         interval,
+		Size:             size,
+	}
+	if debug {
+		opts.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
-	actualTimeout := timeout
-	if actualTimeout == 0 {
-		actualTimeout = defaultTimeout
-	}
+	// Ctrl+C cancels the probe in flight rather than only killing the process,
+	// which matters in loop mode where interrupting is the documented way to
+	// stop. A second signal takes the default action and terminates at once.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	// Handle loop
 	if loopInterval == 0 {
-		if !executeProbe(command, target, actualTimeout) {
+		if !executeProbe(ctx, command, target, opts) {
 			os.Exit(1)
 		}
 		return
@@ -104,9 +147,14 @@ func main() {
 	for {
 		// The return value is intentionally ignored: in loop mode a failing
 		// probe is a result to report, not a reason to terminate.
-		executeProbe(command, target, actualTimeout)
+		executeProbe(ctx, command, target, opts)
 		fmt.Println("---")
-		<-loopTicker.C
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-loopTicker.C:
+		}
 	}
 }
 
@@ -123,18 +171,18 @@ func isKnownCommand(command string) bool {
 // executeProbe runs a single probe and reports whether it succeeded.
 // It never terminates the process, so that callers (in particular loop mode)
 // stay in control of the exit behaviour.
-func executeProbe(command, target string, timeout time.Duration) bool {
+func executeProbe(ctx context.Context, command, target string, opts probe.Options) bool {
 	switch command {
 	case "ping":
-		return handlePing(target, timeout)
+		return handlePing(ctx, target, opts)
 	case "tcp":
-		return handleTCP(target, timeout)
+		return handleTCP(ctx, target, opts)
 	case "tls":
-		return handleTLS(target, timeout, false)
+		return handleTLS(ctx, target, opts, false)
 	case "tls-cert":
-		return handleTLS(target, timeout, true)
+		return handleTLS(ctx, target, opts, true)
 	case "http":
-		return handleHTTP(target, timeout)
+		return handleHTTP(ctx, target, opts)
 	default:
 		fmt.Printf("Error: unknown command '%s'\n\n", command)
 		printUsage()
@@ -155,8 +203,13 @@ func printUsage() {
 	fmt.Println("  http              HTTP/HTTPS status check")
 	fmt.Println("\nFlags:")
 	fmt.Println("  -attempts int     Maximum number of attempts (default: 3)")
+	fmt.Println("  -threshold int    Successful attempts required to pass (default: 1)")
 	fmt.Println("  -timeout duration Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls/tls-cert)")
+	fmt.Println("  -interval duration Pause between attempts (default: 500ms)")
 	fmt.Println("  -loop duration    Loop interval (0 = run once, e.g., 5s, 1m, 10s)")
+	fmt.Println("  -size int         ICMP payload size in bytes, ping only (default: 56)")
+	fmt.Println("  -debug            Log per-attempt detail to stderr")
+	fmt.Println("\nFlags must come before the target.")
 	fmt.Println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("Examples:")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -164,12 +217,12 @@ func printUsage() {
 	fmt.Println("  probe ping 8.8.8.8")
 	fmt.Println("  probe ping google.com")
 	fmt.Println("  probe ping -attempts 5 8.8.8.8")
-	fmt.Println("  probe ping -timeout 2s google.com")
-	fmt.Println("  probe ping -loop 5s 8.8.8.8                     # Run every 5 seconds")
+	fmt.Println("  probe ping -attempts 5 -threshold 3 8.8.8.8      # 3 of up to 5 must answer")
+	fmt.Println("  probe ping -size 1472 gateway.local              # path MTU check")
+	fmt.Println("  probe ping -loop 5s 8.8.8.8                      # Run every 5 seconds")
 
 	fmt.Println("\n2. TCP Port Connectivity Check")
 	fmt.Println("  probe tcp example.com:22")
-	fmt.Println("  probe tcp google.com:443")
 	fmt.Println("  probe tcp -attempts 5 google.com:443")
 	fmt.Println("  probe tcp -loop 10s example.com:22              # Run every 10 seconds")
 
@@ -196,39 +249,47 @@ func printUsage() {
 	fmt.Println("  - TLS/SSL: 5 seconds per attempt")
 }
 
-func handlePing(target string, timeout time.Duration) bool {
-	result := ping.Run(target, maxAttempts, timeout)
+// printSummary prints the fields every probe has in common.
+func printSummary(s probe.Summary) {
+	fmt.Printf("Attempt: %d\n", s.Attempts)
+	fmt.Printf("Success: %v\n", s.Success)
+	if s.Successes > 1 || s.Failures > 0 {
+		fmt.Printf("Successes: %d  Failures: %d\n", s.Successes, s.Failures)
+	}
+	if s.Duration > 0 {
+		fmt.Printf("Duration: %s\n", ms(s.Duration))
+	}
+	if s.Successes > 1 {
+		fmt.Printf("Min/Avg/Max: %s / %s / %s\n", ms(s.Min), ms(s.Avg), ms(s.Max))
+	}
+}
+
+func ms(d time.Duration) string {
+	return fmt.Sprintf("%.2f ms", float64(d.Microseconds())/1000.0)
+}
+
+func handlePing(ctx context.Context, target string, opts probe.Options) bool {
+	result := probeping.RunContext(ctx, target, opts)
 
 	fmt.Printf("Target: %s\n", result.Address)
 	if result.ResolvedIP != "" && result.ResolvedIP != result.Address {
 		fmt.Printf("Resolved IP: %s\n", result.ResolvedIP)
 	}
-	fmt.Printf("Attempt: %d\n", result.Attempts)
-	fmt.Printf("Success: %v\n", result.Success)
-
-	if result.Duration > 0 {
-		fmt.Printf("Duration: %.2f ms\n", float64(result.Duration.Microseconds())/1000.0)
-	}
+	printSummary(result.Summary)
 
 	if result.Error != nil {
 		fmt.Printf("Error: %v\n", result.Error)
 		return false
 	}
-
 	return result.Success
 }
 
-func handleTCP(target string, timeout time.Duration) bool {
-	result := tcp.Run(target, maxAttempts, timeout)
+func handleTCP(ctx context.Context, target string, opts probe.Options) bool {
+	result := probetcp.RunContext(ctx, target, opts)
 
 	fmt.Printf("Host: %s\n", result.Host)
 	fmt.Printf("Port: %s\n", result.Port)
-	fmt.Printf("Attempt: %d\n", result.Attempts)
-	fmt.Printf("Success: %v\n", result.Success)
-
-	if result.Duration > 0 {
-		fmt.Printf("Duration: %.2f ms\n", float64(result.Duration.Microseconds())/1000.0)
-	}
+	printSummary(result.Summary)
 
 	if result.Success {
 		fmt.Printf("Local Address: %s\n", result.LocalAddr)
@@ -239,25 +300,19 @@ func handleTCP(target string, timeout time.Duration) bool {
 		fmt.Printf("Error: %v\n", result.Error)
 		return false
 	}
-
 	return result.Success
 }
 
-func handleTLS(target string, timeout time.Duration, certOnly bool) bool {
-	var result tls.Result
+func handleTLS(ctx context.Context, target string, opts probe.Options, certOnly bool) bool {
+	var result probetls.Result
 	if certOnly {
-		result = tls.RunCertOnly(target, maxAttempts, timeout)
+		result = probetls.RunCertOnlyContext(ctx, target, opts)
 	} else {
-		result = tls.Run(target, maxAttempts, timeout)
+		result = probetls.RunContext(ctx, target, opts)
 	}
 
 	fmt.Printf("Host: %s\n", result.Host)
-	fmt.Printf("Attempt: %d\n", result.Attempts)
-	fmt.Printf("Success: %v\n", result.Success)
-
-	if result.Duration > 0 {
-		fmt.Printf("Duration: %.2f ms\n", float64(result.Duration.Microseconds())/1000.0)
-	}
+	printSummary(result.Summary)
 
 	if result.Success {
 		fmt.Printf("Subject: %s\n", result.Subject)
@@ -275,26 +330,19 @@ func handleTLS(target string, timeout time.Duration, certOnly bool) bool {
 		fmt.Printf("Error: %v\n", result.Error)
 		return false
 	}
-
 	return result.Success
 }
 
-func handleHTTP(target string, timeout time.Duration) bool {
-	result := http.Run(target, maxAttempts, timeout)
+func handleHTTP(ctx context.Context, target string, opts probe.Options) bool {
+	result := probehttp.RunContext(ctx, target, opts)
 
 	fmt.Printf("URL: %s\n", result.URL)
-	fmt.Printf("Attempt: %d\n", result.Attempts)
-	fmt.Printf("Success: %v\n", result.Success)
+	printSummary(result.Summary)
 	fmt.Printf("Status Code: %d\n", result.StatusCode)
-
-	if result.Duration > 0 {
-		fmt.Printf("Duration: %.2f ms\n", float64(result.Duration.Microseconds())/1000.0)
-	}
 
 	if result.Error != nil {
 		fmt.Printf("Error: %v\n", result.Error)
 		return false
 	}
-
 	return result.Success
 }

@@ -1,26 +1,18 @@
 //go:build windows
-// +build windows
 
-package ping
+package probeping
 
 import (
+	"context"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"syscall"
 	"time"
 	"unsafe"
-)
 
-// Result holds the ping result
-type Result struct {
-	Address    string
-	ResolvedIP string // The resolved IPv4 address (may be same as Address if IP was provided)
-	Success    bool
-	Attempts   int
-	BytesRecv  int
-	Error      error
-	Duration   time.Duration
-}
+	"github.com/netyazilim/probe"
+)
 
 // Windows ICMP structures.
 //
@@ -64,30 +56,23 @@ var (
 	procIcmpCloseHandle = iphlpapi.NewProc("IcmpCloseHandle")
 )
 
-// Run performs an ICMP ping to the specified address using Windows ICMP API.
-// address can be an IP address or a hostname.
-// This method does NOT require Administrator privileges.
-// maxAttempts specifies the maximum number of ping attempts.
-// timeout specifies the maximum duration to wait for a response.
-// Returns a Result struct containing the results of the ping operation.
-func Run(address string, maxAttempts int, timeout time.Duration) Result {
-	result := Result{
-		Address:  address,
-		Attempts: maxAttempts,
+func run(ctx context.Context, address string, opts probe.Options) Result {
+	opts = opts.WithDefaults(DefaultTimeout)
+	if err := opts.Validate(); err != nil {
+		return Result{Summary: probe.Summary{Error: err}, Address: address}
 	}
+
+	result := Result{Address: address}
 
 	// Resolve hostname to IP if necessary
 	resolvedTarget := address
 	if net.ParseIP(address) == nil {
-		// Target is not an IP address, try to resolve it as a hostname
-		// Use LookupHost which returns string IPs, then filter for IPv4
 		addrs, err := net.LookupHost(address)
 		if err != nil || len(addrs) == 0 {
 			result.Error = fmt.Errorf("DNS resolution failed: cannot resolve hostname: %v", err)
 			return result
 		}
 
-		// Find first IPv4 address
 		var ipv4Addr string
 		for _, addr := range addrs {
 			if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
@@ -95,34 +80,26 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 				break
 			}
 		}
-
 		if ipv4Addr == "" {
 			result.Error = fmt.Errorf("no IPv4 address found for hostname: %s (IPv6 ping is not yet supported on Windows)", address)
 			return result
 		}
-
 		resolvedTarget = ipv4Addr
 	}
 
-	// Parse resolved IP address
 	ip := net.ParseIP(resolvedTarget)
 	if ip == nil {
 		result.Error = fmt.Errorf("invalid IP address: %s", resolvedTarget)
 		return result
 	}
-
-	// Convert to IPv4
 	ipv4 := ip.To4()
 	if ipv4 == nil {
 		result.Error = fmt.Errorf("only IPv4 is supported: %s", resolvedTarget)
 		return result
 	}
-
-	// Store resolved IP in result
 	result.ResolvedIP = resolvedTarget
 
-	// Convert IP address to uint32 (host byte order for Windows API)
-	// Windows IcmpSendEcho expects IP in host byte order (little-endian on x86/x64)
+	// Windows IcmpSendEcho expects the address in host byte order.
 	ipAddr := uint32(ipv4[3])<<24 | uint32(ipv4[2])<<16 | uint32(ipv4[1])<<8 | uint32(ipv4[0])
 
 	// Create ICMP handle once for all attempts
@@ -135,27 +112,32 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 		_, _, _ = procIcmpCloseHandle.Call(hIcmpFile)
 	}()
 
-	// Prepare ping data
-	data := []byte("PROBE-DATA")
-	dataSize := uint32(len(data))
-
-	// Convert timeout to milliseconds
-	timeoutMs := uint32(timeout.Milliseconds())
+	timeoutMs := uint32(opts.Timeout.Milliseconds())
 	if timeoutMs == 0 {
-		timeoutMs = 1000 // Minimum 1 second
+		timeoutMs = 1000 // the API works in whole milliseconds
 	}
 
-	for i := 0; i < maxAttempts; i++ {
-		result.Attempts = i + 1
+	// The Win32 API matches the reply for us, so the payload only has to give
+	// the packet the requested size; it is built the same way as on Linux so
+	// that both platforms put the same bytes on the wire.
+	runID := uint16(rand.Uint32())
+	var seq uint16
 
-		startTime := time.Now()
+	opts.Logger.Debug("starting ICMP ping",
+		"target", address, "resolved", resolvedTarget, "runID", runID, "size", opts.Size)
 
-		// Call IcmpSendEcho
-		// Microsoft's documentation asks for one ICMP_ECHO_REPLY plus RequestSize
-		// bytes of data, plus 8 more bytes to hold a possible ICMP error message.
+	stats := probe.Repeat(ctx, opts, func(ctx context.Context) (time.Duration, error) {
+		seq++
+		data := newPayload(runID, seq, opts.Size)
+		dataSize := uint32(len(data))
+
+		// Microsoft's documentation asks for one ICMP_ECHO_REPLY plus
+		// RequestSize bytes of data, plus 8 more bytes to hold a possible ICMP
+		// error message.
 		replySize := uint32(unsafe.Sizeof(IcmpEchoReply{}) + uintptr(dataSize) + 8)
 		replyBuf := make([]byte, replySize)
 
+		start := time.Now()
 		ret, _, err := procIcmpSendEcho.Call(
 			hIcmpFile,
 			uintptr(ipAddr),
@@ -166,52 +148,38 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 			uintptr(replySize),
 			uintptr(timeoutMs),
 		)
-
-		// Wall-clock duration around the syscall; used only as a fallback below,
-		// because it also contains the syscall overhead.
-		measured := time.Since(startTime)
-		result.Duration = measured
+		// Wall-clock duration around the syscall; used only as a fallback
+		// below, because it also contains the syscall overhead.
+		measured := time.Since(start)
 
 		if ret == 0 {
-			// Provide more informative error message for common Windows ICMP errors
-			errMsg := err.Error()
-			if errMsg == "Error due to lack of resources." {
-				result.Error = fmt.Errorf("Windows ICMP API error: %v (Note: This may occur with certain network configurations or firewall settings)", err)
-			} else {
-				result.Error = fmt.Errorf("IcmpSendEcho failed: %v", err)
+			if err.Error() == "Error due to lack of resources." {
+				return measured, fmt.Errorf("Windows ICMP API error: %v (Note: This may occur with certain network configurations or firewall settings)", err)
 			}
-			time.Sleep(500 * time.Millisecond)
-			continue
+			return measured, fmt.Errorf("IcmpSendEcho failed: %v", err)
 		}
-
 		if ret != 1 {
-			result.Error = fmt.Errorf("unexpected reply count: %d", ret)
-			time.Sleep(500 * time.Millisecond)
-			continue
+			return measured, fmt.Errorf("unexpected reply count: %d", ret)
 		}
 
-		// Parse reply
 		reply := (*IcmpEchoReply)(unsafe.Pointer(&replyBuf[0]))
-
 		if reply.Status != 0 {
-			result.Error = fmt.Errorf("ping failed with status code: %d", reply.Status)
-			time.Sleep(500 * time.Millisecond)
-			continue
+			return measured, fmt.Errorf("ping failed with status code: %d", reply.Status)
 		}
 
-		// Prefer the round-trip time reported by the OS over the locally measured
-		// value, which additionally contains the syscall overhead.
-		// Its resolution is one millisecond, so a sub-millisecond reply reports 0;
-		// in that case keep the measured value, which is a usable upper bound.
-		if reply.RoundTripTime > 0 {
-			result.Duration = time.Duration(reply.RoundTripTime) * time.Millisecond
-		}
-
-		result.Success = true
 		result.BytesRecv = int(reply.DataSize)
-		result.Error = nil
-		return result
-	}
 
+		// Prefer the round-trip time reported by the OS over the locally
+		// measured value, which additionally contains the syscall overhead.
+		// Its resolution is one millisecond, so a sub-millisecond reply
+		// reports 0; in that case keep the measured value, which is a usable
+		// upper bound.
+		if reply.RoundTripTime > 0 {
+			return time.Duration(reply.RoundTripTime) * time.Millisecond, nil
+		}
+		return measured, nil
+	})
+
+	result.Summary = stats.Summarize(opts.SuccessThreshold)
 	return result
 }

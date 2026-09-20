@@ -1,22 +1,32 @@
-package tls
+package probetls
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/netyazilim/probe"
 )
+
+// DefaultTimeout bounds a single handshake. A TLS handshake needs more
+// headroom than the other probes, hence the larger value.
+const DefaultTimeout = 5 * time.Second
 
 // Result holds TLS/SSL probe result
 type Result struct {
-	Host            string
-	Success         bool
-	Attempts        int
-	Error           error
-	HandshakeError  error
-	Duration        time.Duration
+	probe.Summary
+
+	Host string
+
+	// HandshakeError is set in certificate-only mode when the server presented
+	// a certificate but the handshake could not be completed, typically
+	// because the server requires a client certificate.
+	HandshakeError error
+
 	Subject         string
 	Issuer          string
 	ExpiresAt       time.Time
@@ -25,85 +35,88 @@ type Result struct {
 	CipherSuite     string
 }
 
-// Run performs a strict TLS/SSL probe.
-// The handshake must complete successfully and certificate verification must pass.
+// Run performs a strict TLS/SSL probe: the handshake must complete and
+// certificate verification must pass.
+//
+// It is a thin wrapper over RunContext kept for callers written against the
+// original API.
 func Run(target string, maxAttempts int, timeout time.Duration) Result {
-	return run(target, maxAttempts, timeout, false)
+	return RunContext(context.Background(), target, probe.Options{
+		MaxAttempts: maxAttempts,
+		Timeout:     timeout,
+	})
 }
 
-// RunCertOnly performs a certificate-only TLS/SSL probe.
-// It returns the presented server certificate even if the handshake cannot be
-// fully completed because the server requires a client certificate for mTLS.
+// RunCertOnly performs a certificate-only TLS/SSL probe. It reports the
+// presented server certificate even when the handshake cannot be completed
+// because the server requires a client certificate for mTLS.
+//
+// It is a thin wrapper over RunCertOnlyContext kept for callers written
+// against the original API.
 func RunCertOnly(target string, maxAttempts int, timeout time.Duration) Result {
-	return run(target, maxAttempts, timeout, true)
+	return RunCertOnlyContext(context.Background(), target, probe.Options{
+		MaxAttempts: maxAttempts,
+		Timeout:     timeout,
+	})
 }
 
-func run(target string, maxAttempts int, timeout time.Duration, certOnly bool) Result {
+// RunContext performs a strict TLS/SSL probe, honouring ctx for cancellation.
+func RunContext(ctx context.Context, target string, opts probe.Options) Result {
+	return run(ctx, target, opts, false)
+}
+
+// RunCertOnlyContext performs a certificate-only TLS/SSL probe, honouring ctx
+// for cancellation.
+func RunCertOnlyContext(ctx context.Context, target string, opts probe.Options) Result {
+	return run(ctx, target, opts, true)
+}
+
+func run(ctx context.Context, target string, opts probe.Options, certOnly bool) Result {
 	address, serverName, err := normalizeTLSTarget(target)
 	if err != nil {
-		return Result{
-			Host:     target,
-			Attempts: 0,
-			Error:    err,
-		}
+		return Result{Summary: probe.Summary{Error: err}, Host: target}
 	}
 
-	result := Result{
-		Host:     serverName,
-		Attempts: maxAttempts,
+	opts = opts.WithDefaults(DefaultTimeout)
+	if err := opts.Validate(); err != nil {
+		return Result{Summary: probe.Summary{Error: err}, Host: serverName}
 	}
 
-	for i := 0; i < maxAttempts; i++ {
-		result.Attempts = i + 1
+	result := Result{Host: serverName}
 
-		startTime := time.Now()
+	stats := probe.Repeat(ctx, opts, func(ctx context.Context) (time.Duration, error) {
+		start := time.Now()
 
-		// Establish TCP connection first
-		dialer := &net.Dialer{Timeout: timeout}
-		rawConn, err := dialer.Dial("tcp", address)
+		dialer := &net.Dialer{Timeout: opts.Timeout}
+		rawConn, err := dialer.DialContext(ctx, "tcp", address)
 		if err != nil {
-			result.Duration = time.Since(startTime)
-			result.Error = fmt.Errorf("TCP connection failed: %v", err)
-			result.HandshakeError = nil
-			if i < maxAttempts-1 {
-				time.Sleep(500 * time.Millisecond)
-			}
-			continue
+			return time.Since(start), fmt.Errorf("TCP connection failed: %v", err)
 		}
 
-		// In cert-only mode, still collect the presented certificate even if the
-		// server expects a client certificate (mTLS) and the handshake fails.
+		// In certificate-only mode the presented certificate is collected even
+		// when the server expects a client certificate (mTLS) and the
+		// handshake therefore fails.
 		tlsConn := tls.Client(rawConn, &tls.Config{
 			ServerName:         serverName,
 			InsecureSkipVerify: certOnly,
 		})
 
-		handshakeErr := tlsConn.Handshake()
+		handshakeErr := tlsConn.HandshakeContext(ctx)
 		state := tlsConn.ConnectionState()
-		result.Duration = time.Since(startTime)
+		elapsed := time.Since(start)
 		_ = tlsConn.Close()
 
 		certs := state.PeerCertificates
 		if len(certs) == 0 {
 			if handshakeErr != nil {
-				result.Error = fmt.Errorf("TLS handshake failed: %v", handshakeErr)
-			} else {
-				result.Error = fmt.Errorf("TLS handshake did not return a certificate")
+				return elapsed, fmt.Errorf("TLS handshake failed: %v", handshakeErr)
 			}
-			result.HandshakeError = nil
-			if i < maxAttempts-1 {
-				time.Sleep(500 * time.Millisecond)
-			}
-			continue
+			return elapsed, fmt.Errorf("TLS handshake did not return a certificate")
 		}
 
 		if handshakeErr != nil && !certOnly {
-			result.Error = fmt.Errorf("TLS handshake failed: %v", handshakeErr)
 			result.HandshakeError = handshakeErr
-			if i < maxAttempts-1 {
-				time.Sleep(500 * time.Millisecond)
-			}
-			continue
+			return elapsed, fmt.Errorf("TLS handshake failed: %v", handshakeErr)
 		}
 
 		cert := certs[0]
@@ -113,16 +126,16 @@ func run(target string, maxAttempts int, timeout time.Duration, certOnly bool) R
 		result.DaysUntilExpiry = int(time.Until(cert.NotAfter).Hours() / 24)
 		result.Protocol = tlsVersionToString(state.Version)
 		result.CipherSuite = tls.CipherSuiteName(state.CipherSuite)
-		result.Success = true
-		result.Error = nil
 		if certOnly {
 			result.HandshakeError = handshakeErr
 		} else {
 			result.HandshakeError = nil
 		}
-		break
-	}
 
+		return elapsed, nil
+	})
+
+	result.Summary = stats.Summarize(opts.SuccessThreshold)
 	return result
 }
 
