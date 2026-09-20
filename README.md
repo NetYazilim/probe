@@ -14,12 +14,13 @@ Multi-protocol health check library written in Go. Import as a package in your p
 - **TCP Probe** - Verify port connectivity and connection information (works with both IPv4 and IPv6 targets).
 - **HTTP/HTTPS Probe** - Verify web service health with status code checks (supports IPv4/IPv6 endpoints transparently).
 - **TLS/SSL Probe** - Supports two modes over IPv4 or IPv6: strict TLS validation (`tls`) and certificate-only inspection (`tls-cert`). The certificate-only mode can still read the presented server certificate even when full TLS negotiation is blocked by mTLS/client-certificate requirements.
-- **No external Go package dependencies - uses only Go standard library.**
+- **Minimal dependencies** - `golang.org/x/net` is required for ICMP ping on Linux only; the TCP, HTTP and TLS probes, and the Windows and macOS builds, use the Go standard library alone.
 
 ## Platform Support
 
 - **Linux** - Uses UDP-based ICMP (requires kernel support for unprivileged ping). Supports both IPv4 and IPv6.
 - **Windows** - Uses Win32 ICMP API (no special privileges required). Currently supports IPv4 only for ICMP ping.
+- **macOS and other platforms** - ICMP ping is not implemented and returns an explicit error; the TCP, HTTP and TLS probes work normally.
 
 ### Linux ICMP Ping Configuration
 
@@ -38,6 +39,13 @@ cat /proc/sys/net/ipv4/ping_group_range
 ```bash
 sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
 ```
+
+> On a systemd-based distribution this is usually already the default: systemd
+> ships `net.ipv4.ping_group_range = 0 2147483647` in its
+> `sysctl.d/50-default.conf`, under the comment *"ping(8) without CAP_NET_ADMIN
+> and CAP_NET_RAW"*. Where you are likely to need the command is a container or
+> a minimal image that never runs `systemd-sysctl`, which therefore keeps the
+> kernel default `1 0` (disabled). Check first rather than assuming either way.
 
 **To make the change persistent:**
 
@@ -169,7 +177,7 @@ Success: true
 Duration: 235.67 ms
 Subject: CN=www.google.com
 Issuer: CN=Google Internet Authority G3
-Expires At: 2025-12-15 23:59:59
+Expires At: 2027-07-28 23:59:59
 Days Until Expiry: 310
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
@@ -183,7 +191,7 @@ Success: true
 Duration: 210.12 ms
 Subject: CN=mtls.example.com
 Issuer: CN=Example Issuing CA
-Expires At: 2026-12-15 23:59:59
+Expires At: 2027-04-22 23:59:59
 Days Until Expiry: 213
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
@@ -193,18 +201,52 @@ Handshake Warning: remote error: tls: certificate required
 
 ## Dependencies
 
-This package uses only standard Go library packages:
-No external dependencies required.
+| Package | Required for | Platforms |
+|---|---|---|
+| `golang.org/x/net` (`icmp`, `ipv4`, `ipv6`) | ICMP ping | Linux only |
+
+Everything else — the TCP, HTTP and TLS probes — uses the Go standard library
+alone. On Windows the ICMP ping is implemented against the Win32 `iphlpapi.dll`
+API and needs no external package either, and on other platforms ICMP ping is
+not implemented, so `golang.org/x/net` is pulled in by the Linux build only.
+
+`golang.org/x/sys` appears in `go.mod` as an indirect dependency of
+`golang.org/x/net`.
 
 ## Requirements
 
-- Go 1.20 or later
+- Go 1.26 or later (the version declared in `go.mod`)
 - For ICMP Ping on Linux:
   - Check kernel support: `cat /proc/sys/net/ipv4/ping_group_range`
   - Unprivileged ICMP must be enabled in kernel
-  - To enable: `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"`
+  - To enable: `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"` (already the default on most systemd-based distributions; typically needed in containers and minimal images)
 - Internet connectivity for TCP and TLS probes
 
 ## Error Handling
 
-All probes include retry logic (3 attempts by default) with 500ms delays between attempts. Detailed error messages are provided for troubleshooting.
+All probes retry up to `-attempts` times (3 by default) with a 500 ms pause
+between attempts, and stop at the first success. Detailed error messages are
+provided for troubleshooting.
+
+### Exit codes
+
+| Mode | Behaviour |
+|---|---|
+| Single run | `0` when the probe succeeds, `1` when it fails |
+| Loop (`-loop`) | A failing round is reported and the loop keeps going; the process ends only on `Ctrl+C` |
+
+Invalid arguments are rejected before the first probe runs, with exit code `1`:
+`-attempts` must be at least 1, `-timeout` and `-loop` must not be negative, and
+an unknown command is reported once instead of on every iteration.
+
+### How the round-trip time is measured
+
+| Platform | Source |
+|---|---|
+| Linux | `time.Since`, started immediately before the send and read as soon as the reply arrives. It uses Go's monotonic clock, so wall-clock changes — NTP steps, manual changes, VM restore — cannot distort or negate the result. Being measured inside the process, it also contains the send and receive system-call overhead. |
+| Windows | `ICMP_ECHO_REPLY.RoundTripTime`, the value the Win32 ICMP API itself reports. Its resolution is 1 ms; a reply faster than that reports 0, and the locally measured duration is used instead. |
+
+The two are close but not identical, because they are taken at different
+points: the Linux figure is measured around the system calls, the Windows one
+is produced by the operating system. Compare values across platforms by
+magnitude, not to the microsecond.

@@ -12,12 +12,13 @@ Go ile yazılmış çok protokollü sağlık kontrolü kütüphanesi. Öncelikle
 - **TCP Probe** - Port bağlantısı ve bağlantı bilgilerini doğrulayın (IPv4 ve IPv6 hedeflerde çalışır).
 - **HTTP/HTTPS Probe** - Web servisi sağlığını durum kodu kontrolleriyle doğrulayın (IPv4/IPv6 uç noktaları otomatik desteklenir).
 - **TLS/SSL Probe** - IPv4 ve IPv6 üzerinde iki modu destekler: strict TLS doğrulaması (`tls`) ve yalnızca sertifika inceleme modu (`tls-cert`). Sertifika-only modunda, sunucu mTLS/istemci sertifikası istese ve tam TLS oturumu kurulmasa bile sunulan sunucu sertifikası okunabilir.
-- **Harici Go kütüphane bağımlılığı yoktur - yalnızca Go standart kütüphanesi kullanılır.**
+- **Asgari bağımlılık** - `golang.org/x/net` yalnızca Linux'ta ICMP ping için gereklidir; TCP, HTTP ve TLS probe'ları ile Windows ve macOS derlemeleri tek başına Go standart kütüphanesini kullanır.
 
 ## Platform Desteği
 
 - **Linux** - UDP tabanlı ICMP kullanır (unprivileged ping için kernel desteği gerekir) ve IPv4 ile IPv6 hedeflerini destekler.
 - **Windows** - Win32 ICMP API kullanır (özel yetki gerekmez) ve şu anda ICMP ping için yalnızca IPv4 desteklenir.
+- **macOS ve diğer platformlar** - ICMP ping uygulanmamıştır ve açık bir hata döndürür; TCP, HTTP ve TLS probe'ları normal çalışır.
 
 ### Linux ICMP Ping Konfigürasyonu
 
@@ -36,6 +37,14 @@ cat /proc/sys/net/ipv4/ping_group_range
 ```bash
 sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
 ```
+
+> systemd tabanlı bir dağıtımda bu genellikle zaten varsayılandır: systemd,
+> `sysctl.d/50-default.conf` dosyasında *"ping(8) without CAP_NET_ADMIN and
+> CAP_NET_RAW"* yorumuyla `net.ipv4.ping_group_range = 0 2147483647` satırını
+> getirir. Bu komuta asıl ihtiyaç duyacağınız yer, `systemd-sysctl`
+> çalıştırmayan container'lar ve minimal imajlardır; oralarda kernel'in
+> varsayılanı olan `1 0` (kapalı) geçerli kalır. Varsaymak yerine önce kontrol
+> edin.
 
 **Değişikliği kalıcı hale getirmek için:**
 
@@ -174,7 +183,7 @@ Success: true
 Duration: 235.67 ms
 Subject: CN=www.google.com
 Issuer: CN=Google Internet Authority G3
-Expires At: 2025-12-15 23:59:59
+Expires At: 2027-07-28 23:59:59
 Days Until Expiry: 310
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
@@ -188,7 +197,7 @@ Success: true
 Duration: 210.12 ms
 Subject: CN=mtls.example.com
 Issuer: CN=Example Issuing CA
-Expires At: 2026-12-15 23:59:59
+Expires At: 2027-04-22 23:59:59
 Days Until Expiry: 213
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
@@ -197,18 +206,53 @@ Handshake Warning: remote error: tls: certificate required
 
 ## Bağımlılıklar
 
-Bu paket yalnızca Go standart kütüphanesi paketlerini kullanır:
-Harici bağımlılık gerekmez.
+| Paket | Ne için gerekli | Platform |
+|---|---|---|
+| `golang.org/x/net` (`icmp`, `ipv4`, `ipv6`) | ICMP ping | Yalnızca Linux |
+
+Geri kalan her şey — TCP, HTTP ve TLS probe'ları — yalnızca Go standart
+kütüphanesini kullanır. Windows'ta ICMP ping, Win32 `iphlpapi.dll` API'si
+üzerinden uygulandığı için harici paket gerektirmez; diğer platformlarda ICMP
+ping uygulanmamıştır. Dolayısıyla `golang.org/x/net` yalnızca Linux derlemesine
+dahil olur.
+
+`golang.org/x/sys`, `go.mod` içinde `golang.org/x/net`'in dolaylı bağımlılığı
+olarak görünür.
 
 ## Gereksinimler
 
-- Go 1.20 veya üstü
+- Go 1.26 veya üstü (`go.mod` içinde belirtilen sürüm)
 - Linux'ta ICMP Ping için:
   - Kernel desteğini kontrol edin: `cat /proc/sys/net/ipv4/ping_group_range`
   - Çekirdekte unprivileged ICMP etkinleştirilmiş olmalı
-  - Etkinleştirmek için: `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"`
+  - Etkinleştirmek için: `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"` (systemd tabanlı çoğu dağıtımda zaten varsayılan; asıl container ve minimal imajlarda gerekir)
 - TCP ve TLS probe'ları için internet bağlantısı
 
 ## Hata İşleme
 
-Tüm probe'lar retry mantığı içerir (varsayılan olarak 3 deneme) ve denemeler arasında 500ms gecikmeler vardır. Sorun giderme için detaylı hata mesajları sağlanır.
+Tüm probe'lar `-attempts` kadar (varsayılan 3) yeniden dener, denemeler arasında
+500 ms bekler ve ilk başarıda durur. Sorun giderme için ayrıntılı hata mesajları
+üretilir.
+
+### Çıkış kodları
+
+| Mod | Davranış |
+|---|---|
+| Tek seferlik | Probe başarılıysa `0`, başarısızsa `1` |
+| Döngü (`-loop`) | Başarısız tur raporlanır ve döngü devam eder; süreç yalnızca `Ctrl+C` ile biter |
+
+Geçersiz argümanlar ilk probe çalışmadan önce, `1` çıkış koduyla reddedilir:
+`-attempts` en az 1 olmalı, `-timeout` ve `-loop` negatif olmamalı, bilinmeyen
+komut her turda değil bir kez raporlanır.
+
+### Gidiş-dönüş süresi nasıl ölçülür
+
+| Platform | Kaynak |
+|---|---|
+| Linux | `time.Since`; sayaç gönderimden hemen önce başlatılır, cevap gelir gelmez okunur. Go'nun monotonic saatini kullanır; bu sayede duvar saati değişiklikleri — NTP sıçramaları, elle değişiklik, VM geri yükleme — sonucu bozamaz ya da negatife çeviremez. Ölçüm süreç içinde yapıldığı için gönderim ve alım sistem çağrılarının maliyetini de içerir. |
+| Windows | `ICMP_ECHO_REPLY.RoundTripTime`; Win32 ICMP API'sinin kendi bildirdiği değer. Çözünürlüğü 1 ms'dir; daha hızlı cevaplarda 0 döner ve o durumda yerel olarak ölçülen süre kullanılır. |
+
+İkisi birbirine yakındır ama birebir aynı değildir, çünkü farklı noktalardan
+alınır: Linux'taki değer sistem çağrılarının etrafında ölçülür, Windows'taki
+işletim sistemi tarafından üretilir. Platformlar arası karşılaştırmayı
+mikrosaniye düzeyinde değil, büyüklük düzeyinde yapın.

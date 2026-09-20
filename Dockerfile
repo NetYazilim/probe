@@ -21,7 +21,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o probe cmd/main.go
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /etc/passwd /etc/passwd
+COPY --from=builder /etc/group /etc/group
 COPY --from=builder /app/probe /probe
 WORKDIR /
-USER probeuser
+# Numeric uid:gid so the image works even where the name cannot be resolved.
+USER 1001:1001
 ENTRYPOINT ["/probe"]
