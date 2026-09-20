@@ -45,6 +45,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Reject unknown commands before doing anything else, so that a typo is not
+	// reported once per iteration in loop mode.
+	if !isKnownCommand(command) {
+		fmt.Printf("Error: unknown command '%s'\n\n", command)
+		printUsage()
+		os.Exit(1)
+	}
+
 	// Get remaining args (should be target)
 	args := fs.Args()
 	if len(args) < 1 {
@@ -54,6 +62,20 @@ func main() {
 	}
 
 	target := args[0]
+
+	// Validate flags
+	if maxAttempts < 1 {
+		fmt.Printf("Error: -attempts must be at least 1 (got %d)\n", maxAttempts)
+		os.Exit(1)
+	}
+	if timeout < 0 {
+		fmt.Printf("Error: -timeout must not be negative (got %v)\n", timeout)
+		os.Exit(1)
+	}
+	if loopInterval < 0 {
+		fmt.Printf("Error: -loop must not be negative (got %v)\n", loopInterval)
+		os.Exit(1)
+	}
 
 	// Set default timeout based on command
 	defaultTimeout := 1 * time.Second
@@ -68,7 +90,9 @@ func main() {
 
 	// Handle loop
 	if loopInterval == 0 {
-		executeProbe(command, target, actualTimeout)
+		if !executeProbe(command, target, actualTimeout) {
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -78,28 +102,43 @@ func main() {
 	defer loopTicker.Stop()
 
 	for {
+		// The return value is intentionally ignored: in loop mode a failing
+		// probe is a result to report, not a reason to terminate.
 		executeProbe(command, target, actualTimeout)
 		fmt.Println("---")
 		<-loopTicker.C
 	}
 }
 
-func executeProbe(command, target string, timeout time.Duration) {
+// isKnownCommand reports whether command is a supported probe command.
+func isKnownCommand(command string) bool {
+	switch command {
+	case "ping", "tcp", "tls", "tls-cert", "http":
+		return true
+	default:
+		return false
+	}
+}
+
+// executeProbe runs a single probe and reports whether it succeeded.
+// It never terminates the process, so that callers (in particular loop mode)
+// stay in control of the exit behaviour.
+func executeProbe(command, target string, timeout time.Duration) bool {
 	switch command {
 	case "ping":
-		handlePing(target, timeout)
+		return handlePing(target, timeout)
 	case "tcp":
-		handleTCP(target, timeout)
+		return handleTCP(target, timeout)
 	case "tls":
-		handleTLS(target, timeout, false)
+		return handleTLS(target, timeout, false)
 	case "tls-cert":
-		handleTLS(target, timeout, true)
+		return handleTLS(target, timeout, true)
 	case "http":
-		handleHTTP(target, timeout)
+		return handleHTTP(target, timeout)
 	default:
 		fmt.Printf("Error: unknown command '%s'\n\n", command)
 		printUsage()
-		os.Exit(1)
+		return false
 	}
 }
 
@@ -157,7 +196,7 @@ func printUsage() {
 	fmt.Println("  - TLS/SSL: 5 seconds per attempt")
 }
 
-func handlePing(target string, timeout time.Duration) {
+func handlePing(target string, timeout time.Duration) bool {
 	result := ping.Run(target, maxAttempts, timeout)
 
 	fmt.Printf("Target: %s\n", result.Address)
@@ -173,11 +212,13 @@ func handlePing(target string, timeout time.Duration) {
 
 	if result.Error != nil {
 		fmt.Printf("Error: %v\n", result.Error)
-		os.Exit(1)
+		return false
 	}
+
+	return result.Success
 }
 
-func handleTCP(target string, timeout time.Duration) {
+func handleTCP(target string, timeout time.Duration) bool {
 	result := tcp.Run(target, maxAttempts, timeout)
 
 	fmt.Printf("Host: %s\n", result.Host)
@@ -196,11 +237,13 @@ func handleTCP(target string, timeout time.Duration) {
 
 	if result.Error != nil {
 		fmt.Printf("Error: %v\n", result.Error)
-		os.Exit(1)
+		return false
 	}
+
+	return result.Success
 }
 
-func handleTLS(target string, timeout time.Duration, certOnly bool) {
+func handleTLS(target string, timeout time.Duration, certOnly bool) bool {
 	var result tls.Result
 	if certOnly {
 		result = tls.RunCertOnly(target, maxAttempts, timeout)
@@ -230,11 +273,13 @@ func handleTLS(target string, timeout time.Duration, certOnly bool) {
 
 	if result.Error != nil {
 		fmt.Printf("Error: %v\n", result.Error)
-		os.Exit(1)
+		return false
 	}
+
+	return result.Success
 }
 
-func handleHTTP(target string, timeout time.Duration) {
+func handleHTTP(target string, timeout time.Duration) bool {
 	result := http.Run(target, maxAttempts, timeout)
 
 	fmt.Printf("URL: %s\n", result.URL)
@@ -248,6 +293,8 @@ func handleHTTP(target string, timeout time.Duration) {
 
 	if result.Error != nil {
 		fmt.Printf("Error: %v\n", result.Error)
-		os.Exit(1)
+		return false
 	}
+
+	return result.Success
 }
