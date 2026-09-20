@@ -22,15 +22,38 @@ type Result struct {
 	Duration   time.Duration
 }
 
-// Windows ICMP structures
+// Windows ICMP structures.
+//
+// These mirror the Win32 definitions exactly; field widths matter because the
+// reply buffer is reinterpreted in place.
+//
+//	typedef struct ip_option_information {
+//	  UCHAR  Ttl; UCHAR Tos; UCHAR Flags; UCHAR OptionsSize; PUCHAR OptionsData;
+//	} IP_OPTION_INFORMATION;
+type IPOptionInformation struct {
+	TTL         uint8
+	TOS         uint8
+	Flags       uint8
+	OptionsSize uint8
+	OptionsData uintptr
+}
+
+// IcmpEchoReply mirrors ICMP_ECHO_REPLY:
+//
+//	IPAddr Address; ULONG Status; ULONG RoundTripTime;
+//	USHORT DataSize; USHORT Reserved; PVOID Data;
+//	IP_OPTION_INFORMATION Options;
+//
+// DataSize and Reserved are USHORT (not ULONG); declaring them wider shifts
+// Data and Options to the wrong offsets.
 type IcmpEchoReply struct {
 	Address       uint32
-	Status        int32
-	RoundTripTime uint32
-	DataSize      uint32
-	Reserved      uint32
+	Status        uint32
+	RoundTripTime uint32 // milliseconds, measured by the OS
+	DataSize      uint16
+	Reserved      uint16
 	Data          uintptr
-	Options       uintptr
+	Options       IPOptionInformation
 }
 
 // Win32 API calls
@@ -128,7 +151,9 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 		startTime := time.Now()
 
 		// Call IcmpSendEcho
-		replySize := uint32(unsafe.Sizeof(IcmpEchoReply{}) + uintptr(dataSize))
+		// Microsoft's documentation asks for one ICMP_ECHO_REPLY plus RequestSize
+		// bytes of data, plus 8 more bytes to hold a possible ICMP error message.
+		replySize := uint32(unsafe.Sizeof(IcmpEchoReply{}) + uintptr(dataSize) + 8)
 		replyBuf := make([]byte, replySize)
 
 		ret, _, err := procIcmpSendEcho.Call(
@@ -142,8 +167,10 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 			uintptr(timeoutMs),
 		)
 
-		duration := time.Since(startTime)
-		result.Duration = duration
+		// Wall-clock duration around the syscall; used only as a fallback below,
+		// because it also contains the syscall overhead.
+		measured := time.Since(startTime)
+		result.Duration = measured
 
 		if ret == 0 {
 			// Provide more informative error message for common Windows ICMP errors
@@ -172,8 +199,17 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 			continue
 		}
 
+		// Prefer the round-trip time reported by the OS over the locally measured
+		// value, which additionally contains the syscall overhead.
+		// Its resolution is one millisecond, so a sub-millisecond reply reports 0;
+		// in that case keep the measured value, which is a usable upper bound.
+		if reply.RoundTripTime > 0 {
+			result.Duration = time.Duration(reply.RoundTripTime) * time.Millisecond
+		}
+
 		result.Success = true
 		result.BytesRecv = int(reply.DataSize)
+		result.Error = nil
 		return result
 	}
 

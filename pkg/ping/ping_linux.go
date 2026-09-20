@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -79,17 +77,21 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 
 	conn, err := icmp.ListenPacket(network, listenAddr)
 	if err != nil {
-		result.Error = fmt.Errorf("failed to listen: %v (ICMP requires CAP_NET_RAW capability or root privileges on Linux)", err)
+		result.Error = fmt.Errorf("failed to listen: %v (unprivileged ICMP needs net.ipv4.ping_group_range to cover this process's gid; check it with: cat /proc/sys/net/ipv4/ping_group_range, enable it with: sysctl -w net.ipv4.ping_group_range='0 2147483647')", err)
 		return result
 	}
 	defer conn.Close()
 
 	for i := 0; i < maxAttempts; i++ {
 		result.Attempts = i + 1
+		// NOTE: on a SOCK_DGRAM ICMP socket the kernel assigns the echo ID itself
+		// and overwrites whatever is set here, so replies can NOT be matched by ID.
+		// The payload is the only reliable match, which is why it is compared
+		// byte-for-byte below and why it carries a per-attempt unique value.
 		pid := os.Getpid() & 0xffff
 		seq := i + 1
-		nanoTime := time.Now().UnixNano()
-		payload := []byte(fmt.Sprintf("PROBE-%s-SEQ%d-%d", resolvedTarget, seq, nanoTime))
+		nonce := time.Now().UnixNano() // uniqueness only, never used for timing
+		payload := []byte(fmt.Sprintf("PROBE-%s-SEQ%d-%d", resolvedTarget, seq, nonce))
 
 		msg := icmp.Message{
 			Type: msgType, Code: 0,
@@ -103,6 +105,11 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 		binaryMsg, _ := msg.Marshal(nil)
 		targetAddr := &net.UDPAddr{IP: net.ParseIP(resolvedTarget)}
 
+		// Measured with the monotonic clock: time.Since is immune to wall-clock
+		// steps (NTP corrections, manual changes, VM restore) that would otherwise
+		// distort - or even negate - the round-trip time.
+		start := time.Now()
+
 		if _, err := conn.WriteTo(binaryMsg, targetAddr); err != nil {
 			result.Error = fmt.Errorf("send error: %v", err)
 			time.Sleep(500 * time.Millisecond)
@@ -115,6 +122,7 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 			continue
 		}
 		n, _, err := conn.ReadFrom(reply)
+		elapsed := time.Since(start)
 
 		if err != nil {
 			result.Error = fmt.Errorf("no response: %v", err)
@@ -163,20 +171,10 @@ func Run(address string, maxAttempts int, timeout time.Duration) Result {
 			continue
 		}
 
-		// Parse timestamp from payload
-		parts := strings.Split(replyData, "-")
-		if len(parts) > 0 {
-			lastPart := parts[len(parts)-1]
-			sentNano, err := strconv.ParseInt(lastPart, 10, 64)
-			if err == nil {
-				result.Duration = time.Duration(time.Now().UnixNano() - sentNano)
-			} else {
-				result.Duration = 0
-			}
-		}
-
+		result.Duration = elapsed
 		result.Success = true
 		result.BytesRecv = n
+		result.Error = nil
 		return result
 	}
 	return result
