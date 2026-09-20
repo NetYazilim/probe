@@ -27,12 +27,33 @@ type Result struct {
 	// because the server requires a client certificate.
 	HandshakeError error
 
-	Subject         string
-	Issuer          string
+	Subject string
+	Issuer  string
+
+	// NotBefore and ExpiresAt are the leaf certificate's validity window, and
+	// DaysUntilExpiry counts from now to ExpiresAt. It goes negative once the
+	// certificate has expired.
+	NotBefore       time.Time
 	ExpiresAt       time.Time
 	DaysUntilExpiry int
-	Protocol        string
-	CipherSuite     string
+
+	// Expired and NotYetValid report the leaf certificate against the current
+	// time. In strict mode the handshake already rejects such a certificate;
+	// in certificate-only mode nothing else would, which is why they are
+	// checked explicitly.
+	Expired     bool
+	NotYetValid bool
+
+	// ChainLength is how many certificates the server presented, and
+	// ChainExpiresAt is the earliest expiry among them - the weakest link. An
+	// intermediate that expires before the leaf breaks clients even though the
+	// leaf still looks healthy, and is invisible if only the leaf is examined.
+	ChainLength          int
+	ChainExpiresAt       time.Time
+	ChainDaysUntilExpiry int
+
+	Protocol    string
+	CipherSuite string
 }
 
 // Run performs a strict TLS/SSL probe: the handshake must complete and
@@ -120,16 +141,56 @@ func run(ctx context.Context, target string, opts probe.Options, certOnly bool) 
 		}
 
 		cert := certs[0]
+		now := time.Now()
+
 		result.Subject = cert.Subject.String()
 		result.Issuer = cert.Issuer.String()
+		result.NotBefore = cert.NotBefore
 		result.ExpiresAt = cert.NotAfter
 		result.DaysUntilExpiry = int(time.Until(cert.NotAfter).Hours() / 24)
+		result.Expired = now.After(cert.NotAfter)
+		result.NotYetValid = now.Before(cert.NotBefore)
+
+		// The chain is only as good as its earliest expiry.
+		earliest := cert.NotAfter
+		for _, c := range certs[1:] {
+			if c.NotAfter.Before(earliest) {
+				earliest = c.NotAfter
+			}
+		}
+		result.ChainLength = len(certs)
+		result.ChainExpiresAt = earliest
+		result.ChainDaysUntilExpiry = int(time.Until(earliest).Hours() / 24)
+
 		result.Protocol = tlsVersionToString(state.Version)
 		result.CipherSuite = tls.CipherSuiteName(state.CipherSuite)
 		if certOnly {
 			result.HandshakeError = handshakeErr
 		} else {
 			result.HandshakeError = nil
+		}
+
+		// Reported as a failure even though a certificate was obtained: for a
+		// health check, answering "success" about an expired certificate is
+		// precisely the wrong answer. Every field above stays populated so the
+		// caller can see what is wrong.
+		//
+		// Strict mode never reaches this, since the handshake fails first; it
+		// is certificate-only mode that would otherwise report an expired
+		// certificate as healthy.
+		if result.Expired {
+			return elapsed, fmt.Errorf("certificate expired on %s (%d days ago)",
+				cert.NotAfter.Format(time.RFC3339), -result.DaysUntilExpiry)
+		}
+		if result.NotYetValid {
+			return elapsed, fmt.Errorf("certificate is not valid until %s",
+				cert.NotBefore.Format(time.RFC3339))
+		}
+		// A leaf that outlives its own chain is a live outage waiting to
+		// happen, so it is reported rather than quietly accepted.
+		if result.ChainExpiresAt.Before(now) {
+			return elapsed, fmt.Errorf("a certificate in the presented chain expired on %s",
+				result.ChainExpiresAt.Format(time.RFC3339))
 		}
 
 		return elapsed, nil

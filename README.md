@@ -13,7 +13,7 @@ Multi-protocol health check library written in Go. Import as a package in your p
 - **ICMP Ping Probe** - Check host availability using ICMP Echo (supports both IP addresses and hostnames; IPv6 support available on Linux).
 - **TCP Probe** - Verify port connectivity and connection information (works with both IPv4 and IPv6 targets).
 - **HTTP/HTTPS Probe** - Verify web service health with status code checks (supports IPv4/IPv6 endpoints transparently).
-- **TLS/SSL Probe** - Supports two modes over IPv4 or IPv6: strict TLS validation (`tls`) and certificate-only inspection (`tls-cert`). The certificate-only mode can still read the presented server certificate even when full TLS negotiation is blocked by mTLS/client-certificate requirements.
+- **TLS/SSL Probe** - Supports two modes over IPv4 or IPv6: strict TLS validation (`tls`) and certificate-only inspection (`tls-cert`). The certificate-only mode can still read the presented server certificate even when full TLS negotiation is blocked by mTLS/client-certificate requirements. Both modes check the validity window and report the whole presented chain, so an intermediate that expires before the leaf does not go unnoticed.
 - **Success threshold** - decide how many of the attempts have to answer. A probe stops as soon as the threshold is met, and equally as soon as the remaining attempts can no longer reach it.
 - **Cancellable** - every probe takes a `context.Context` and honours it while dialling, handshaking and waiting for a reply, not just between attempts.
 - **Configurable ICMP payload size** - `-size` makes ping usable for path MTU checks, and keeps packets to different targets the same size so their round-trip times are comparable.
@@ -278,15 +278,25 @@ Duration: 125.45 ms
 ### TLS/SSL (strict)
 ```
 Host: google.com
-Attempt: 3
+Attempt: 1
 Success: true
 Duration: 235.67 ms
 Subject: CN=www.google.com
 Issuer: CN=Google Internet Authority G3
+Valid From: 2026-08-01 00:00:00
 Expires At: 2027-07-28 23:59:59
 Days Until Expiry: 310
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
+```
+
+When the server presents intermediates that expire before the leaf, the
+weakest link is reported as well — this is the case that looking only at the
+leaf hides:
+
+```
+Days Until Expiry: 310
+Chain Expires At: 2026-10-01 12:00:00 (10 days, 2 certificates presented)
 ```
 
 ### TLS/SSL (certificate-only)
@@ -297,12 +307,42 @@ Success: true
 Duration: 210.12 ms
 Subject: CN=mtls.example.com
 Issuer: CN=Example Issuing CA
+Valid From: 2026-09-21 00:00:00
 Expires At: 2027-04-22 23:59:59
 Days Until Expiry: 213
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
 Handshake Warning: remote error: tls: certificate required
 ```
+
+### Certificate validity
+
+In strict mode the handshake itself rejects a certificate that has expired or
+is not valid yet. Certificate-only mode skips verification by design — that is
+how it reads a certificate from a server demanding mTLS — so the dates are
+checked explicitly instead. An expired certificate is reported as a failure,
+because answering "success" about one is precisely the wrong answer for a
+health check, and the details are still printed so the problem is visible:
+
+```
+$ probe tls-cert expired.example.com:443
+Host: expired.example.com
+Attempt: 1
+Success: false
+Successes: 0  Failures: 1
+Subject: CN=expired.example.com
+Valid From: 2025-08-16 23:17:20
+Expires At: 2026-09-10 23:17:20
+Days Until Expiry: -10
+Certificate Status: EXPIRED
+TLS Version: TLS 1.3
+Cipher Suite: TLS_AES_128_GCM_SHA256
+Error: certificate expired on 2026-09-10T23:17:20Z (10 days ago)
+```
+
+The same applies to a certificate whose validity has not started
+(`Certificate Status: NOT YET VALID`) and to an expired certificate anywhere in
+the presented chain.
 
 
 ## Dependencies

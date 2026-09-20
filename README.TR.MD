@@ -11,7 +11,7 @@ Go ile yazılmış çok protokollü sağlık kontrolü kütüphanesi. Öncelikle
 - **ICMP Ping Probe** - ICMP Echo kullanarak ana bilgisayar erişilebilirliğini kontrol edin (IP adresleri ve hostname'leri destekler; Linux'ta IPv6 desteği vardır).
 - **TCP Probe** - Port bağlantısı ve bağlantı bilgilerini doğrulayın (IPv4 ve IPv6 hedeflerde çalışır).
 - **HTTP/HTTPS Probe** - Web servisi sağlığını durum kodu kontrolleriyle doğrulayın (IPv4/IPv6 uç noktaları otomatik desteklenir).
-- **TLS/SSL Probe** - IPv4 ve IPv6 üzerinde iki modu destekler: strict TLS doğrulaması (`tls`) ve yalnızca sertifika inceleme modu (`tls-cert`). Sertifika-only modunda, sunucu mTLS/istemci sertifikası istese ve tam TLS oturumu kurulmasa bile sunulan sunucu sertifikası okunabilir.
+- **TLS/SSL Probe** - IPv4 ve IPv6 üzerinde iki modu destekler: strict TLS doğrulaması (`tls`) ve yalnızca sertifika inceleme modu (`tls-cert`). Sertifika-only modunda, sunucu mTLS/istemci sertifikası istese ve tam TLS oturumu kurulmasa bile sunulan sunucu sertifikası okunabilir. Her iki mod da geçerlilik aralığını kontrol eder ve sunulan zincirin tamamını raporlar; böylece leaf'ten önce dolan bir ara sertifika gözden kaçmaz.
 - **Başarı eşiği** - denemelerin kaçının cevap vermesi gerektiğine siz karar verirsiniz. Probe, eşiğe ulaşır ulaşmaz durur; kalan denemeler eşiğe artık yetişemiyorsa yine durur.
 - **İptal edilebilir** - her probe bir `context.Context` alır ve onu yalnızca denemeler arasında değil, bağlanırken, handshake yaparken ve cevap beklerken de dinler.
 - **Ayarlanabilir ICMP payload boyutu** - `-size` ping'i path MTU kontrolü için kullanılabilir kılar; ayrıca farklı hedeflere aynı boyutta paket gönderildiği için gidiş-dönüş süreleri karşılaştırılabilir olur.
@@ -284,15 +284,24 @@ Duration: 125.45 ms
 ### TLS/SSL (strict)
 ```
 Host: google.com
-Attempt: 3
+Attempt: 1
 Success: true
 Duration: 235.67 ms
 Subject: CN=www.google.com
 Issuer: CN=Google Internet Authority G3
+Valid From: 2026-08-01 00:00:00
 Expires At: 2027-07-28 23:59:59
 Days Until Expiry: 310
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
+```
+
+Sunucu, leaf'ten önce süresi dolan ara sertifikalar sunuyorsa en zayıf halka da
+raporlanır — yalnızca leaf'e bakmanın gizlediği durum tam olarak budur:
+
+```
+Days Until Expiry: 310
+Chain Expires At: 2026-10-01 12:00:00 (10 days, 2 certificates presented)
 ```
 
 ### TLS/SSL (yalnızca sertifika)
@@ -303,12 +312,43 @@ Success: true
 Duration: 210.12 ms
 Subject: CN=mtls.example.com
 Issuer: CN=Example Issuing CA
+Valid From: 2026-09-21 00:00:00
 Expires At: 2027-04-22 23:59:59
 Days Until Expiry: 213
 TLS Version: TLS 1.3
 Cipher Suite: TLS_AES_128_GCM_SHA256
 Handshake Warning: remote error: tls: certificate required
 ```
+
+### Sertifika geçerliliği
+
+Strict modda süresi dolmuş ya da henüz geçerli olmayan bir sertifikayı zaten
+handshake'in kendisi reddeder. Yalnızca sertifika modu ise doğrulamayı tasarım
+gereği atlar — mTLS isteyen bir sunucudan sertifikayı okuyabilmesinin yolu
+budur — bu yüzden tarihler ayrıca kontrol edilir. Süresi dolmuş bir sertifika
+başarısızlık olarak raporlanır, çünkü bir sağlık kontrolünün böyle bir
+sertifika için "başarılı" demesi tam olarak yanlış cevaptır; ayrıntılar yine de
+yazdırılır ki sorun görünür olsun:
+
+```
+$ probe tls-cert expired.example.com:443
+Host: expired.example.com
+Attempt: 1
+Success: false
+Successes: 0  Failures: 1
+Subject: CN=expired.example.com
+Valid From: 2025-08-16 23:17:20
+Expires At: 2026-09-10 23:17:20
+Days Until Expiry: -10
+Certificate Status: EXPIRED
+TLS Version: TLS 1.3
+Cipher Suite: TLS_AES_128_GCM_SHA256
+Error: certificate expired on 2026-09-10T23:17:20Z (10 days ago)
+```
+
+Aynısı geçerliliği henüz başlamamış sertifikalar (`Certificate Status: NOT YET
+VALID`) ve sunulan zincirde süresi dolmuş herhangi bir sertifika için de
+geçerlidir.
 
 ## Bağımlılıklar
 
