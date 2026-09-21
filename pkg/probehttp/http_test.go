@@ -104,14 +104,14 @@ func TestRunContextTreats4xxAsFailure(t *testing.T) {
 	}
 }
 
-func TestRunContextReusesConnections(t *testing.T) {
-	// The response body has to be drained before the connection can go back to
-	// the pool. If it is not, every attempt opens a fresh connection, which is
-	// what this counts.
+// countingServer returns a test server that always answers with status and a
+// counter of the connections it accepted.
+func countingServer(t *testing.T, status int) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
 	var newConns atomic.Int32
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("body that must be drained"))
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte("a body the prober has to read to the end"))
 	}))
 	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		if state == http.StateNew {
@@ -120,15 +120,42 @@ func TestRunContextReusesConnections(t *testing.T) {
 	}
 	srv.Start()
 	t.Cleanup(srv.Close)
+	return srv, &newConns
+}
+
+func TestEveryAttemptOpensItsOwnConnection(t *testing.T) {
+	// A retry has to re-test the whole path, not talk over the connection the
+	// previous attempt left behind - that connection may be the broken part.
+	srv, newConns := countingServer(t, http.StatusInternalServerError)
 
 	r := RunContext(context.Background(), srv.URL, fast())
 
 	if r.Attempts != 3 {
 		t.Fatalf("Attempts = %d, want 3", r.Attempts)
 	}
-	if got := newConns.Load(); got != 1 {
-		t.Errorf("server accepted %d connections for 3 attempts, want 1: "+
-			"an undrained body prevents the connection from being reused", got)
+	if got := newConns.Load(); got != 3 {
+		t.Errorf("server accepted %d connections for 3 attempts, want 3: "+
+			"attempts are reusing a pooled connection", got)
+	}
+}
+
+func TestSeparateRunsDoNotShareConnections(t *testing.T) {
+	// The regression this guards: a client built with the zero Transport uses
+	// the process-wide http.DefaultTransport pool, so a probe that runs more
+	// often than the pool's idle timeout answers over an already-open
+	// connection. It then resolves no name and repeats no handshake, and
+	// reports success right through a DNS outage.
+	srv, newConns := countingServer(t, http.StatusOK)
+
+	for i := range 2 {
+		if r := RunContext(context.Background(), srv.URL, fast()); !r.Success {
+			t.Fatalf("run %d: Success = false, error: %v", i+1, r.Error)
+		}
+	}
+
+	if got := newConns.Load(); got != 2 {
+		t.Errorf("server accepted %d connections for 2 separate runs, want 2: "+
+			"the second run reused a connection instead of re-testing the path", got)
 	}
 }
 

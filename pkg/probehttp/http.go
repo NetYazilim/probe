@@ -36,8 +36,30 @@ func Run(url string, maxAttempts int, timeout time.Duration) Result {
 	})
 }
 
+// newTransport returns the transport every probe runs on.
+//
+// It is cloned from http.DefaultTransport so the probe keeps proxy support,
+// HTTP/2 negotiation and the standard dial and handshake timeouts, but with
+// connection reuse switched off.
+//
+// Keep-alives have to go because they hide outages. http.DefaultTransport is a
+// process-wide pool, so a client built with the zero Transport shares idle
+// connections with every other request in the program, across calls. A probe
+// that runs more often than the idle timeout then answers over a connection
+// that is already open: it resolves no name, dials nothing and repeats no TLS
+// handshake, and so keeps reporting success while DNS, routing or the
+// certificate are broken. Each attempt has to walk the whole path.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DisableKeepAlives = true
+	return t
+}
+
 // RunContext performs an HTTP/HTTPS probe against url, honouring ctx for
 // cancellation both between and during requests.
+//
+// Every attempt opens its own connection, so the measured duration covers name
+// resolution, the TCP dial and, for HTTPS, the TLS handshake.
 func RunContext(ctx context.Context, url string, opts probe.Options) Result {
 	opts = opts.WithDefaults(DefaultTimeout)
 	if err := opts.Validate(); err != nil {
@@ -45,7 +67,8 @@ func RunContext(ctx context.Context, url string, opts probe.Options) Result {
 	}
 
 	result := Result{URL: url}
-	client := &http.Client{Timeout: opts.Timeout}
+	client := &http.Client{Timeout: opts.Timeout, Transport: newTransport()}
+	defer client.CloseIdleConnections()
 
 	stats := probe.Repeat(ctx, opts, func(ctx context.Context) (time.Duration, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -59,8 +82,9 @@ func RunContext(ctx context.Context, url string, opts probe.Options) Result {
 			return time.Since(start), fmt.Errorf("request failed: %v", err)
 		}
 
-		// Drain before closing so the connection can be reused; without this
-		// every attempt opens a fresh one.
+		// Read the body to the end before closing so the server sees the
+		// response finish rather than a reset. The connection closes either
+		// way, because keep-alives are off.
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		elapsed := time.Since(start)
