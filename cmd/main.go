@@ -341,7 +341,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "\nFlags:")
 	fmt.Fprintln(w, "  -attempts int      Maximum number of attempts (default: 3)")
 	fmt.Fprintln(w, "  -threshold int     Successful attempts required to pass (default: 1)")
-	fmt.Fprintln(w, "  -timeout duration  Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls/tls-cert)")
+	fmt.Fprintln(w, "  -timeout duration  Timeout per attempt (default: 1s for ping/tcp, 5s for http/tls/tls-cert)")
 	fmt.Fprintln(w, "  -interval duration Pause between attempts (default: 500ms)")
 	fmt.Fprintln(w, "  -loop duration     Loop interval (0 = run once, e.g., 5s, 1m, 10s)")
 	fmt.Fprintln(w, "  -size int          ICMP payload size in bytes, ping only (default: 56)")

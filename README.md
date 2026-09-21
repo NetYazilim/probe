@@ -106,7 +106,7 @@ The zero value is usable: every field left at zero takes its default.
 |---|---|---|
 | `MaxAttempts` | 3 | Upper bound on attempts, not a target |
 | `SuccessThreshold` | 1 | Successful attempts needed to pass; must not exceed `MaxAttempts` |
-| `Timeout` | 1s (5s for TLS) | Bounds a single attempt, not the run |
+| `Timeout` | 1s (5s for HTTP and TLS) | Bounds a single attempt, not the run |
 | `Interval` | 500ms | Pause between attempts |
 | `Size` | 56 | ICMP payload bytes; ignored by the other probes |
 | `Logger` | discard | `*slog.Logger` receiving per-attempt detail |
@@ -146,10 +146,10 @@ Two consequences worth planning for:
 
 - HTTP durations are larger and vary more than a keep-alive client's, and are
   not comparable with the numbers reported by v1.2.x and earlier.
-- The 1s default timeout is tight for HTTPS against a remote host, now that a
-  single attempt has to cover the handshake as well. Give `Options.Timeout` (or
-  `-timeout` on the CLI) a few seconds for HTTPS targets; the TLS probe defaults
-  to 5s for the same reason.
+- The default timeout is 5s rather than the 1s the ping and TCP probes use,
+  because an attempt here carries the same work the TLS probe does. Against a
+  slow resolver even that can be tight; raise `Options.Timeout` (or `-timeout`
+  on the CLI) if a target regularly needs longer.
 
 The transport is cloned from `http.DefaultTransport`, so proxy settings taken
 from the environment, HTTP/2 negotiation and the standard dial and handshake
@@ -206,7 +206,7 @@ alias on every caller, so the packages are now `pkg/probeping`, `pkg/probetcp`,
 ```
 -attempts int      Maximum number of attempts (default: 3)
 -threshold int     Successful attempts required to pass (default: 1)
--timeout duration  Timeout per attempt (default: 1s for ping/tcp/http, 5s for tls/tls-cert)
+-timeout duration  Timeout per attempt (default: 1s for ping/tcp, 5s for http/tls/tls-cert)
 -interval duration Pause between attempts (default: 500ms)
 -loop duration     Loop interval (0 = run once, e.g., 5s, 1m, 10s)
 -size int          ICMP payload size in bytes, ping only (default: 56)
@@ -237,8 +237,8 @@ tls-cert           TLS/SSL certificate inspection without requiring a full hands
 
 - **ICMP Ping**: 1 second per attempt
 - **TCP**: 1 second per attempt
-- **HTTP/HTTPS**: 1 second per attempt — tight for HTTPS, where the attempt also
-  covers the TLS handshake; see [Connections](#connections)
+- **HTTP/HTTPS**: 5 seconds per attempt — an attempt also covers name
+  resolution and, over HTTPS, the handshake; see [Connections](#connections)
 - **TLS/SSL**: 5 seconds per attempt
 
 Each probe supports 3 retry attempts by default.

@@ -10,8 +10,11 @@ import (
 	"github.com/netyazilim/probe"
 )
 
-// DefaultTimeout bounds a single request.
-const DefaultTimeout = 1 * time.Second
+// DefaultTimeout bounds a single request. It matches the TLS probe rather than
+// the ping and TCP ones because an attempt here carries the same work: with
+// keep-alives off, every request resolves the name, dials, and over HTTPS
+// completes the handshake before the response is even asked for.
+const DefaultTimeout = 5 * time.Second
 
 // Result holds HTTP probe result
 type Result struct {
