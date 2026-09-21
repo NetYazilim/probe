@@ -12,7 +12,7 @@ Multi-protocol health check library written in Go. Import as a package in your p
 
 - **ICMP Ping Probe** - Check host availability using ICMP Echo (supports both IP addresses and hostnames; IPv6 support available on Linux).
 - **TCP Probe** - Verify port connectivity and connection information (works with both IPv4 and IPv6 targets).
-- **HTTP/HTTPS Probe** - Verify web service health with status code checks (supports IPv4/IPv6 endpoints transparently).
+- **HTTP/HTTPS Probe** - Verify web service health with status code checks (supports IPv4/IPv6 endpoints transparently). Every attempt opens its own connection, so a check re-tests name resolution and the handshake instead of answering over a pooled one.
 - **TLS/SSL Probe** - Supports two modes over IPv4 or IPv6: strict TLS validation (`tls`) and certificate-only inspection (`tls-cert`). The certificate-only mode can still read the presented server certificate even when full TLS negotiation is blocked by mTLS/client-certificate requirements. Both modes check the validity window and report the whole presented chain, so an intermediate that expires before the leaf does not go unnoticed.
 - **Success threshold** - decide how many of the attempts have to answer. A probe stops as soon as the threshold is met, and equally as soon as the remaining attempts can no longer reach it.
 - **Cancellable** - every probe takes a `context.Context` and honours it while dialling, handshaking and waiting for a reply, not just between attempts.
@@ -128,6 +128,33 @@ Each package adds its own fields on top: `Address`/`ResolvedIP`/`BytesRecv` for
 ping, `Host`/`Port`/`LocalAddr`/`RemoteAddr` for tcp, `URL`/`StatusCode` for
 http, and the certificate details for tls.
 
+### Connections
+
+Every HTTP attempt opens its own connection and closes it when the response has
+been read: the probe runs on its own transport, with keep-alives off. `Duration`
+for an HTTP probe therefore covers name resolution, the TCP dial and, over
+HTTPS, the TLS handshake — not only the request and the response.
+
+This is deliberate. A client left on Go's default transport draws from a
+process-wide connection pool, so a probe scheduled more often than the pool's
+90s idle timeout answers over a connection that is already open: it resolves no
+name, dials nothing and repeats no handshake. It then keeps reporting success
+while DNS, routing or the certificate are broken — which is to say, while
+exactly the failures the probe exists to catch are happening.
+
+Two consequences worth planning for:
+
+- HTTP durations are larger and vary more than a keep-alive client's, and are
+  not comparable with the numbers reported by v1.2.x and earlier.
+- The 1s default timeout is tight for HTTPS against a remote host, now that a
+  single attempt has to cover the handshake as well. Give `Options.Timeout` (or
+  `-timeout` on the CLI) a few seconds for HTTPS targets; the TLS probe defaults
+  to 5s for the same reason.
+
+The transport is cloned from `http.DefaultTransport`, so proxy settings taken
+from the environment, HTTP/2 negotiation and the standard dial and handshake
+timeouts are unchanged.
+
 ### Backwards compatibility
 
 `Run(target, maxAttempts, timeout)` still exists in every package and behaves
@@ -210,7 +237,8 @@ tls-cert           TLS/SSL certificate inspection without requiring a full hands
 
 - **ICMP Ping**: 1 second per attempt
 - **TCP**: 1 second per attempt
-- **HTTP/HTTPS**: 1 second per attempt
+- **HTTP/HTTPS**: 1 second per attempt — tight for HTTPS, where the attempt also
+  covers the TLS handshake; see [Connections](#connections)
 - **TLS/SSL**: 5 seconds per attempt
 
 Each probe supports 3 retry attempts by default.
